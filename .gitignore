@@ -8,10 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+.venv_opd
 
 # reap specfic
 artifacts/
 scratch/
+third_party/
+slime/
+Megatron-LM/
+verl/
+hf_cache/
+data/*.json.gz
+data/*.parquet
 *.log
 .env
 .uv_cache/

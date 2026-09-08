@@ -112,6 +112,8 @@ def prune(
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
             setattr(moe, model_attrs["experts"], retained_experts)
+            if hasattr(moe, "num_experts"):
+                moe.num_experts = len(retained_expert_indicies)
             if model.__class__.__name__.lower() == "Ernie4_5_MoEForCausalLM".lower():
                 # transformers version >=4.54
                 # prune expert score correction bias too
@@ -312,13 +314,13 @@ def main():
 
         dump_args_to_yaml(
             pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
         )
 
     # eval

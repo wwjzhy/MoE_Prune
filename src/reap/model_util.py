@@ -16,6 +16,31 @@ MODEL_ATTRS = {
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    # Qwen1.5-MoE (e.g. Qwen/Qwen1.5-MoE-A2.7B). Routed experts only;
+    # the shared expert and shared_expert_gate are left intact.
+    "Qwen2MoeForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+    # OLMoE (e.g. allenai/OLMoE-1B-7B-0924). All decoder layers are MoE.
+    "OlmoeForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
     "Qwen3-Coder-30B-A3B-Instruct": {
         "moe_block": "mlp",
         "gate_proj": "gate_proj",

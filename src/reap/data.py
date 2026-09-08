@@ -17,6 +17,7 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 import uuid
 import json
 import re
@@ -210,7 +211,25 @@ def _load_raw_dataset(dataset_name, split, subset=None):
     """Load a raw HuggingFace dataset, handling special cases like C4."""
     try:
         if dataset_name == "allenai/c4":
-            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
+            local_c4 = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "..",
+                    "data",
+                    "c4-train.00000-of-01024.json.gz",
+                )
+            )
+            if os.path.isfile(local_c4):
+                file_url = local_c4
+            else:
+                endpoint = os.environ.get(
+                    "HF_ENDPOINT", "https://huggingface.co"
+                ).rstrip("/")
+                file_url = (
+                    f"{endpoint}/datasets/allenai/c4/resolve/main/"
+                    "en/c4-train.00000-of-01024.json.gz"
+                )
             return load_dataset(
                 "json", data_files={"train": file_url}, split="train", streaming=False
             )

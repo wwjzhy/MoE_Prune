@@ -10,6 +10,10 @@ from transformers import (
     Llama4TextConfig,
     MixtralConfig,
     MixtralForCausalLM,
+    OlmoeConfig,
+    OlmoeForCausalLM,
+    Qwen2MoeConfig,
+    Qwen2MoeForCausalLM,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
@@ -22,6 +26,8 @@ from reap.observer import (
     Glm44MoEObserverHookConfig,
     Llama4MoEObserverHookConfig,
     MixtralMoEObserverHookConfig,
+    OlmoeObserverHookConfig,
+    Qwen2MoEObserverHookConfig,
     Qwen3MoEObserverHookConfig,
 )
 
@@ -43,6 +49,46 @@ def _make_qwen3_moe_model():
             num_experts=2,
             num_experts_per_tok=1,
             norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
+def _make_qwen2_moe_model():
+    model = Qwen2MoeForCausalLM(
+        Qwen2MoeConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=8,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_hidden_layers=3,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
+def _make_olmoe_model():
+    model = OlmoeForCausalLM(
+        OlmoeConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=3,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_experts=2,
+            num_experts_per_tok=1,
+            norm_topk_prob=False,
+            pad_token_id=0,
         )
     )
     model.eval()
@@ -142,6 +188,8 @@ def _make_glm4_moe_model():
 
 MODEL_FACTORIES = [
     pytest.param(_make_qwen3_moe_model, id="Qwen3MoeForCausalLM"),
+    pytest.param(_make_qwen2_moe_model, id="Qwen2MoeForCausalLM"),
+    pytest.param(_make_olmoe_model, id="OlmoeForCausalLM"),
     pytest.param(_make_llama4_model, id="Llama4ForCausalLM"),
     pytest.param(_make_mixtral_model, id="MixtralForCausalLM"),
     pytest.param(_make_deepseek_v2_model, id="DeepseekV2ForCausalLM"),
@@ -152,6 +200,14 @@ MODEL_FACTORIES = [
 
 def _make_qwen3_hook_config():
     return Qwen3MoEObserverHookConfig()
+
+
+def _make_qwen2_moe_hook_config():
+    return Qwen2MoEObserverHookConfig()
+
+
+def _make_olmoe_hook_config():
+    return OlmoeObserverHookConfig()
 
 
 def _make_llama4_hook_config():
@@ -185,6 +241,20 @@ MOE_LOOKUP_CASES = [
         [0, 1, 2],
         "mlp",
         id="Qwen3MoeForCausalLM",
+    ),
+    pytest.param(
+        _make_qwen2_moe_model,
+        _make_qwen2_moe_hook_config,
+        [0, 1, 2],
+        "mlp",
+        id="Qwen2MoeForCausalLM",
+    ),
+    pytest.param(
+        _make_olmoe_model,
+        _make_olmoe_hook_config,
+        [0, 1, 2],
+        "mlp",
+        id="OlmoeForCausalLM",
     ),
     pytest.param(
         _make_llama4_model,

@@ -797,14 +797,14 @@ def main():
 
         dump_args_to_yaml(
             merged_model_dir,
-            reap_args,
-            model_args,
-            ds_args,
-            obs_args,
-            cluster_args,
-            kd_args,
-            eval_args,
-            merge_args,
+            reap_args=reap_args,
+            model_args=model_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            cluster_args=cluster_args,
+            kd_args=kd_args,
+            eval_args=eval_args,
+            merge_args=merge_args,
         )
 
         if model_name == "artifacts/models/GLM-4.5-Air":

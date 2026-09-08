@@ -9,6 +9,10 @@ from transformers import (
     DeepseekV2Config,
     Ernie4_5_MoeConfig,
     Glm4MoeConfig,
+    OlmoeConfig,
+    OlmoeForCausalLM,
+    Qwen2MoeConfig,
+    Qwen2MoeForCausalLM,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
@@ -72,6 +76,46 @@ def _make_qwen3_model():
             num_experts=3,
             num_experts_per_tok=1,
             norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
+def _make_qwen2_moe_model():
+    model = Qwen2MoeForCausalLM(
+        Qwen2MoeConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_hidden_layers=3,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_experts=3,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
+def _make_olmoe_model():
+    model = OlmoeForCausalLM(
+        OlmoeConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_experts=3,
+            num_experts_per_tok=1,
+            norm_topk_prob=False,
+            pad_token_id=0,
         )
     )
     model.eval()
@@ -216,6 +260,20 @@ def _assert_prune_result(observer_data, pruned_model, n_experts_to_prune):
         expected_num_experts = original_num_experts - n_experts_to_prune
         assert _expert_count_for_layer(pruned_model, layer_idx) == expected_num_experts
         assert _router_out_features_for_layer(pruned_model, layer_idx) == expected_num_experts
+        moe = get_moe(pruned_model, layer_idx)
+        if hasattr(moe, "num_experts"):
+            assert moe.num_experts == expected_num_experts
+        if pruned_model.__class__.__name__ == "Qwen2MoeForCausalLM":
+            assert hasattr(moe, "shared_expert")
+            assert moe.shared_expert is not None
+
+    if pruned_model.__class__.__name__ in {"Qwen2MoeForCausalLM", "OlmoeForCausalLM"}:
+        pruned_model.eval()
+        with torch.no_grad():
+            pruned_model(
+                input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
+                use_cache=False,
+            )
 
 
 def _run_prune(observer_data, model, tmp_path, subdir_name):
@@ -236,6 +294,16 @@ ARCHITECTURE_CASES = [
         _make_qwen3_model,
         _make_mock_batches,
         id="qwen3",
+    ),
+    pytest.param(
+        _make_qwen2_moe_model,
+        _make_mock_batches,
+        id="qwen2-moe",
+    ),
+    pytest.param(
+        _make_olmoe_model,
+        _make_mock_batches,
+        id="olmoe",
     ),
     pytest.param(
         _make_glm_model,

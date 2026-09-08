@@ -485,6 +485,17 @@ class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
 
 
 @dataclass
+class Qwen2MoEObserverHookConfig(MoETransformerObserverConfig):
+    # Qwen1.5-MoE / Qwen2MoeSparseMoeBlock. Shared expert is not hooked.
+    module_class_name_to_hook_regex: Optional[str] = "Qwen2MoeSparseMoeBlock"
+
+
+@dataclass
+class OlmoeObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "OlmoeSparseMoeBlock"
+
+
+@dataclass
 class Llama4MoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "Llama4TextMoe"
     fused_experts: bool = True  # Llama4 uses fused experts
@@ -527,6 +538,8 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
+    "Qwen2MoeForCausalLM": Qwen2MoEObserverHookConfig,
+    "OlmoeForCausalLM": OlmoeObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
     "MixtralForCausalLM": MixtralMoEObserverHookConfig,
     "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,

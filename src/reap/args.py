@@ -55,7 +55,9 @@ class ModelArgs:
             #     "Qwen/Qwen3-30B-A3B-Instruct-2507",
             #     "openai/gpt-oss-20b",
             #     "openai/gpt-oss-120b",
-            #     "zai-org/GLM-4.5-Air"
+            #     "zai-org/GLM-4.5-Air",
+            #     "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+            #     "allenai/OLMoE-1B-7B-0924",
             # ],
         },
     )

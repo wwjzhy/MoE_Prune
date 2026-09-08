@@ -37,6 +37,11 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         "gpt-oss-120b": "openai/gpt-oss-120b",
         "GLM-4.5-Air": "zai-org/GLM-4.5-Air",
         "Qwen3-Coder-480B-A35B-Instruct-FP8": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        "Qwen1.5-MoE-A2.7B-Chat": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        "Qwen1.5-MoE-A2.7B": "Qwen/Qwen1.5-MoE-A2.7B",
+        "OLMoE-1B-7B-0924": "allenai/OLMoE-1B-7B-0924",
+        "OLMoE-1B-7B-0125-Instruct": "allenai/OLMoE-1B-7B-0125-Instruct",
+        "OLMoE-1B-7B-0125": "allenai/OLMoE-1B-7B-0125",
     }
 
     original_model = None
@@ -206,28 +211,36 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     if eval_args.run_lm_eval:
         results_file_base_name = results_dir / "lm_eval_results"
-        model_args = {
-            "pretrained": model_name,
-            "tensor_parallel_size": num_gpus,
-            "gpu_memory_utilization": 0.85,
-            "num_concurrent": 32,
-            "timeout": 1200,
-            "max_retries": 10,
-            "trust_remote_code": True,
-        }
+        if use_server:
+            lm_eval_model_args = {
+                "pretrained": model_name,
+                "tensor_parallel_size": num_gpus,
+                "gpu_memory_utilization": 0.85,
+                "num_concurrent": 32,
+                "timeout": 1200,
+                "max_retries": 10,
+                "trust_remote_code": True,
+            }
+        else:
+            # HuggingFace backend: do not pass vLLM-only kwargs into from_pretrained.
+            lm_eval_model_args = {
+                "pretrained": model_name,
+                "trust_remote_code": True,
+                "dtype": "bfloat16",
+            }
         if "baidu" in model_name.lower():
             logger.warning("Using slow tokenizer for Ernie-4.5")
-            model_args["use_fast_tokenizer"] = False
+            lm_eval_model_args["use_fast_tokenizer"] = False
         if use_server:
-            model_args["base_url"] = f"{server_endpoint}/v1/completions"
-            model_args["tokenized_requests"] = False
+            lm_eval_model_args["base_url"] = f"{server_endpoint}/v1/completions"
+            lm_eval_model_args["tokenized_requests"] = False
         logger.info(f"Running lm-eval on tasks {eval_args.lm_eval_tasks}")
         is_ernie = "ernie" in model_name.lower()
         logger.warning(f"Is Ernie: {is_ernie}, using batch size 1")
         if use_server:
             results = evaluator.simple_evaluate(
                 model="local-completions",
-                model_args=model_args,
+                model_args=lm_eval_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 random_seed=seed,
@@ -240,7 +253,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
         else:
             results = evaluator.simple_evaluate(
                 model="hf",
-                model_args=model_args,
+                model_args=lm_eval_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 batch_size="auto",
@@ -251,16 +264,24 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 fewshot_as_multiturn=False,
             )
         try:
+            table = make_table(results)
+            print(table)
             with open(f"{results_file_base_name}_table.txt", "w") as f:
-                print(make_table(results))
-                print(make_table(results), file=f)
+                print(table, file=f)
                 if "groups" in results:
-                    print(make_table(results, "groups"))
                     print(make_table(results, "groups"), file=f)
+            serializable = {}
+            for task_name, metrics in (results.get("results") or {}).items():
+                serializable[task_name] = {
+                    k: (float(v) if hasattr(v, "item") else v)
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float, str, bool, type(None)))
+                    or hasattr(v, "item")
+                }
             with open(f"{results_file_base_name}.json", "w") as f:
-                json.dump(results, f)
+                json.dump({"results": serializable}, f, indent=2)
         except Exception as e:
-            pass
+            logger.exception("Failed to save lm-eval results: %s", e)
         logger.info(f"Finished evaluating lm-eval")
 
     try:
