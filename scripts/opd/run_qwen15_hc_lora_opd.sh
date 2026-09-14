@@ -9,6 +9,8 @@
 #   GPUS=0,1,2,3
 #   SMOKE=1
 #   ROLLOUT_NAME=sglang|vllm
+#   ROLLOUT_MODE=sync|async
+#   FREE_CACHE_ENGINE=False
 #   LORA_RANK=32 TARGET_MODULES=all-linear
 #   VERL_ROOT / VERL_PYTHON
 set -euo pipefail
@@ -88,7 +90,27 @@ if (( TEACHER_GPUS % TEACHER_TP != 0 )); then
   echo "TEACHER_GPUS=${TEACHER_GPUS} must be divisible by TEACHER_TP=${TEACHER_TP}" >&2
   exit 1
 fi
-ROLLOUT_TP="${ROLLOUT_TP:-1}"
+if [[ -z "${ROLLOUT_TP:-}" ]]; then
+  if (( STUDENT_GPUS >= 2 )); then
+    ROLLOUT_TP=2
+  else
+    ROLLOUT_TP=1
+  fi
+fi
+if (( STUDENT_GPUS % ROLLOUT_TP != 0 )); then
+  echo "STUDENT_GPUS=${STUDENT_GPUS} must be divisible by ROLLOUT_TP=${ROLLOUT_TP}" >&2
+  exit 1
+fi
+# AgentLoopManager initializes only the rollout-server ranks.  With a colocated
+# FSDP actor, vLLM sleep/wake and dynamic LoRA loading can then make the other
+# ranks enter a model all-gather before every rollout rank is ready.  The
+# resulting mismatched collective eventually trips the NCCL watchdog.
+#
+# This job is single-turn OPD and does not need the async agent loop, so keep
+# startup and weight synchronization collective across the WorkerGroup.  Also
+# keep the vLLM cache engine resident to avoid the problematic sleep/wake path.
+ROLLOUT_MODE="${ROLLOUT_MODE:-sync}"
+FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-False}"
 
 SMOKE="${SMOKE:-0}"
 LORA_RANK="${LORA_RANK:-32}"
@@ -108,6 +130,11 @@ if [[ "${SMOKE}" == "1" ]]; then
   TOTAL_STEPS=2
   SAVE_FREQ=1
   EPOCHS=1
+  # Prefer a boring initialization path for the connectivity smoke.  These can
+  # be explicitly re-enabled to isolate an offload/layered-summon regression.
+  PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
+  OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-False}"
+  LAYERED_SUMMON="${LAYERED_SUMMON:-False}"
 else
   MAX_PROMPT="${MAX_PROMPT:-512}"
   MAX_RESP="${MAX_RESP:-1024}"
@@ -116,6 +143,9 @@ else
   TOTAL_STEPS="${TOTAL_STEPS:-}"
   SAVE_FREQ="${SAVE_FREQ:-10}"
   EPOCHS="${EPOCHS:-2}"
+  PARAM_OFFLOAD="${PARAM_OFFLOAD:-True}"
+  OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
+  LAYERED_SUMMON="${LAYERED_SUMMON:-True}"
 fi
 MAX_NUM_TOKENS=$((MAX_PROMPT + MAX_RESP + 1))
 STUDENT_MAX_TOKEN_LEN_PER_GPU="${STUDENT_MAX_TOKEN_LEN_PER_GPU:-$((MICRO_BS * (MAX_PROMPT + MAX_RESP)))}"
@@ -131,6 +161,8 @@ export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${WANDB_DIR:-${SAVE_DIR}/wandb_offline}"
 export CUDA_VISIBLE_DEVICES="${GPUS}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
 if [[ "${TARGET_MODULES}" == *","* ]]; then
   TARGET_MODULES_ARG="[${TARGET_MODULES}]"
@@ -169,22 +201,25 @@ ACTOR=(
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BS}"
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}"
-  actor_rollout_ref.actor.fsdp_config.param_offload=True
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+  actor_rollout_ref.actor.fsdp_config.param_offload="${PARAM_OFFLOAD}"
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload="${OPTIMIZER_OFFLOAD}"
 )
 
 ROLLOUT=(
   actor_rollout_ref.rollout.name="${ROLLOUT_NAME}"
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}"
+  actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}"
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM:-0.35}"
   actor_rollout_ref.rollout.n=1
+  actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS:-${TRAIN_BS}}"
   actor_rollout_ref.rollout.temperature=0.8
   actor_rollout_ref.rollout.max_model_len="${MAX_NUM_TOKENS}"
   actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_NUM_TOKENS}"
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}"
   actor_rollout_ref.rollout.load_format=safetensors
-  actor_rollout_ref.rollout.layered_summon=True
+  actor_rollout_ref.rollout.free_cache_engine="${FREE_CACHE_ENGINE}"
+  actor_rollout_ref.rollout.layered_summon="${LAYERED_SUMMON}"
   actor_rollout_ref.rollout.enforce_eager="${ENFORCE_EAGER:-True}"
 )
 
@@ -199,6 +234,7 @@ DISTILLATION=(
   distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="${TEACHER_GPU_MEM:-0.45}"
   distillation.teacher_models.teacher_model.inference.max_model_len="${MAX_NUM_TOKENS}"
   distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${MAX_NUM_TOKENS}"
+  distillation.teacher_models.teacher_model.inference.max_num_seqs="${TEACHER_MAX_NUM_SEQS:-${TRAIN_BS}}"
   distillation.teacher_models.teacher_model.inference.enforce_eager="${ENFORCE_EAGER:-True}"
   distillation.distillation_loss.loss_mode="${LOSS_MODE}"
   distillation.distillation_loss.topk=64
@@ -230,7 +266,8 @@ echo "============================================================"
 echo "HC-SMoE LoRA-OPD via verl (FSDP + PEFT)"
 echo "  verl      ${VERL_ROOT}"
 echo "  python    ${VERL_PYTHON}"
-echo "  rollout   ${ROLLOUT_NAME}"
+echo "  rollout   ${ROLLOUT_NAME} mode=${ROLLOUT_MODE} tp=${ROLLOUT_TP} free_cache_engine=${FREE_CACHE_ENGINE}"
+echo "  fsdp      param_offload=${PARAM_OFFLOAD} optimizer_offload=${OPTIMIZER_OFFLOAD} layered_summon=${LAYERED_SUMMON}"
 echo "  student   ${STUDENT_HF}"
 echo "  teacher   ${TEACHER_HF}"
 echo "  gpus      ${GPUS}  student=${STUDENT_GPUS} teacher=${TEACHER_GPUS} teacher_tp=${TEACHER_TP}"
