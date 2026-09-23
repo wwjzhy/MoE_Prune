@@ -12,6 +12,8 @@
 #   ROLLOUT_MODE=sync|async
 #   FREE_CACHE_ENGINE=False
 #   LORA_RANK=32 TARGET_MODULES=all-linear
+#   RESUME_MODE=auto|disable|resume_path RESUME_FROM=/path/to/global_step_N
+#   KEEP_LAST=2
 #   VERL_ROOT / VERL_PYTHON
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,14 +123,48 @@ TARGET_MODULES="${TARGET_MODULES:-all-linear}"
 LR="${LR:-3e-5}"
 LOSS_MODE="${DISTILLATION_LOSS_MODE:-k1}"
 USE_POLICY_GRADIENT="${USE_POLICY_GRADIENT:-True}"
+RESUME_MODE="${RESUME_MODE:-auto}"
+RESUME_FROM="${RESUME_FROM:-}"
+KEEP_LAST="${KEEP_LAST:-2}"
+
+case "${RESUME_MODE}" in
+  auto|disable|resume_path) ;;
+  *)
+    echo "RESUME_MODE must be auto, disable, or resume_path; got: ${RESUME_MODE}" >&2
+    exit 1
+    ;;
+esac
+if [[ -n "${RESUME_FROM}" ]]; then
+  if [[ ! -d "${RESUME_FROM}" ]]; then
+    echo "Resume checkpoint directory not found: ${RESUME_FROM}" >&2
+    exit 1
+  fi
+  if [[ ! "$(basename "${RESUME_FROM}")" =~ ^global_step_[0-9]+$ ]]; then
+    echo "RESUME_FROM must point to a global_step_N directory: ${RESUME_FROM}" >&2
+    exit 1
+  fi
+  if [[ ! -d "${RESUME_FROM}/actor" || ! -f "${RESUME_FROM}/data.pt" ]]; then
+    echo "Incomplete verl checkpoint (need actor/ and data.pt): ${RESUME_FROM}" >&2
+    exit 1
+  fi
+  RESUME_FROM="$(cd "${RESUME_FROM}" && pwd)"
+  RESUME_MODE=resume_path
+elif [[ "${RESUME_MODE}" == "resume_path" ]]; then
+  echo "RESUME_FROM is required when RESUME_MODE=resume_path" >&2
+  exit 1
+fi
+if [[ "${KEEP_LAST}" != "null" && ! "${KEEP_LAST}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "KEEP_LAST must be a positive integer or null; got: ${KEEP_LAST}" >&2
+  exit 1
+fi
 
 if [[ "${SMOKE}" == "1" ]]; then
   MAX_PROMPT=256
   MAX_RESP=256
   TRAIN_BS=4
   MICRO_BS=1
-  TOTAL_STEPS=2
-  SAVE_FREQ=1
+  TOTAL_STEPS="${TOTAL_STEPS:-2}"
+  SAVE_FREQ="${SAVE_FREQ:-1}"
   EPOCHS=1
   # Prefer a boring initialization path for the connectivity smoke.  These can
   # be explicitly re-enabled to isolate an offload/layered-summon regression.
@@ -254,8 +290,10 @@ TRAINER=(
   trainer.val_before_train=False
   trainer.test_freq=-1
   trainer.save_freq="${SAVE_FREQ}"
+  trainer.max_actor_ckpt_to_keep="${KEEP_LAST}"
   trainer.total_epochs="${EPOCHS}"
-  trainer.resume_mode=disable
+  trainer.resume_mode="${RESUME_MODE}"
+  trainer.resume_from_path="${RESUME_FROM:-null}"
   trainer.critic_warmup=0
 )
 if [[ -n "${TOTAL_STEPS}" ]]; then
@@ -273,6 +311,7 @@ echo "  teacher   ${TEACHER_HF}"
 echo "  gpus      ${GPUS}  student=${STUDENT_GPUS} teacher=${TEACHER_GPUS} teacher_tp=${TEACHER_TP}"
 echo "  lora      rank=${LORA_RANK} alpha=${LORA_ALPHA} target=${TARGET_MODULES}"
 echo "  save      ${SAVE_DIR}"
+echo "  resume    mode=${RESUME_MODE} from=${RESUME_FROM:-latest-in-save-dir} keep_last=${KEEP_LAST}"
 echo "============================================================"
 echo "After a ckpt appears:"
 echo "  bash ${SCRIPT_DIR}/merge_lora_ckpt.sh ${SAVE_DIR}/global_step_N ${OPD_ARTIFACTS}/hc_smoe_lora_opd_hf"

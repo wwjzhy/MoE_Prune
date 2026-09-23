@@ -444,3 +444,335 @@ Recovery = (Score_after_OPD - Score_E4-H)
 ## 当前停止线
 
 现在只实现并运行 Exp #4，然后运行 Exp #5。不要同时追加 router LoRA、attention LoRA、不同 LoRA rank、不同 calibration mixture 或更多 compression ratio；只有 E4-H 与 E5-H 出现正信号后再单独设计 ablation。
+
+---
+
+# Exp #6（2026-09-23）— 12U+3M + Joint KD/OPD
+
+> **最新调度：** 本节是当前批准执行的实验，优先于文首及旧节中的历史停止线。旧Exp #4/#5保留原编号和内容，不改名、不覆盖。
+
+论文方法保持两个 stage：
+
+```text
+Stage 1：每层保护12个重要experts，将其余48个融合为3个super-experts
+Stage 2：只在3个super-experts上联合优化teacher-forced KD和on-policy distillation
+```
+
+统一命名：`12U+3M` 表示每层最终保留12个 untouched experts 和3个 merge-modified super-experts。最终物理expert数为15/60，retention为25%，compression为75%。
+
+## Exp #6 Stage 1 — 12U+3M 极端压缩（无训练）
+
+**研究问题：** 在仅保留25%物理experts时，保护高saliency experts并将剩余experts集中融合为少量super-experts，是否优于相同保留率的纯剪枝？
+
+### 固定设置
+
+| 项目 | 设置 |
+|------|------|
+| 模型 | `Qwen1.5-MoE-A2.7B-Chat` |
+| MoE层数 | 24 |
+| 原始routed experts | 每层60；shared expert不参与压缩 |
+| Protected experts | 每层12，保持原权重 |
+| Merge pool | 每层剩余48 |
+| Super-experts | 每层3，每组固定16个原始experts |
+| 最终物理experts | 每层15；12 untouched + 3 super |
+| Calibration | NuminaMath 1,536 + The-Stack-Smol 1,536 |
+| Calibration长度 | 3,072 sequences × 512 tokens |
+| Seed | 42 |
+
+### Stage 1算法
+
+1. 在calibration set上计算REAP saliency，选择每层Top-12作为protected experts。
+2. 对剩余48个experts计算组合相似度：
+
+```text
+similarity(i, j) = 0.5 * router_profile_cosine(i, j)
+                 + 0.5 * gated_output_cosine(i, j)
+```
+
+3. 使用balanced/constrained k-medoids划分成3组，严格满足每组16个experts。
+4. 每组选择saliency最高的expert作为神经元对齐reference。
+5. 使用activation cost + weight cost构造Hungarian matching；同一个排列必须同时应用于`gate_proj`/`up_proj`的行和`down_proj`的列。
+6. 对齐后按组内归一化REAP saliency一次性融合16个原始权重：
+
+```text
+alpha_j = saliency_j / sum_group(saliency)
+W_super = sum_j alpha_j * aligned(W_j)
+```
+
+禁止递归pairwise average；每个super-expert必须始终从16个原始expert权重一次性生成。
+
+### Group router
+
+不得删除48个router rows后直接给3个super-experts新建随机/平均gate，也不得保存60份重复expert权重。
+
+保留原始60维router logits，并聚合成15个group logits：
+
+```text
+protected singleton: z_group = z_expert
+merge group G:       z_group = logsumexp({z_j | j in G})
+```
+
+随后在15个group logits上执行Top-4 softmax。router保留60行的开销相对expert FFN可忽略，但实际只允许存在15个物理expert modules。
+
+### 必须断言并保存
+
+每层压缩结束后必须检查：
+
+```text
+len(protected) == 12
+len(groups) == 3
+all(len(group) == 16)
+protected与3个groups两两不相交
+protected ∪ group_1 ∪ group_2 ∪ group_3 == {0, ..., 59}
+physical_expert_count == 15
+```
+
+保存`group_manifest.json`，至少包含：
+
+```text
+layer_id
+protected_expert_ids
+三组source_expert_ids
+alignment_reference_id
+组内saliency和fusion weights
+原始expert_id到物理expert_id的router mapping
+```
+
+### 最小对照
+
+| ID | 方法 | 每层最终结构 |
+|----|------|--------------|
+| E6-T | Teacher | 60 experts |
+| E6-P | Pure REAP prune | 15 experts |
+| E6-S | 12U+3M | 12 untouched + 3×(16→1) super-experts |
+
+旧版dynamic Hybrid和Fixed Hybrid先不跑；当前只验证最简核心假设。
+
+### 评测与停止线
+
+先完成小规模generation smoke，再运行完整：
+
+- GSM8K、MATH-500；
+- HumanEval+、MBPP+、LiveCodeBench；
+- MC-8回归检查。
+
+报告`Math Avg`、`Code Avg`、`GEN Avg`、`MC Avg`以及真实checkpoint大小。
+
+**停止线：** 若E6-S出现乱码/重复退化，或GEN Avg明显低于E6-P，则先检查group router和物理权重共享；确认实现正确后仍明显更差，则不启动Exp #6 Stage 2。
+
+**复用：** clustering/alignment/fusion优先复用`src/reap/cluster.py`、`src/reap/permute.py`、`src/reap/merge.py`，只新增balanced assignment、group router和manifest输出。
+
+**状态：** 未实现、未跑。
+
+---
+
+## Exp #6 Stage 2 — Super-3 Joint KD + OPD恢复
+
+**研究问题：** 对极端融合产生的3个super-experts同时施加teacher-forced KD和on-policy distillation，能否在只更新5%原始routed expert位置的情况下恢复数学与代码能力？
+
+这是一个统一的recovery stage，不保存KD阶段checkpoint后重新启动OPD；同一个LoRA、optimizer和global-step内联合计算两个loss。
+
+### 固定输入
+
+| 项目 | 设置 |
+|------|------|
+| Student | Exp #6 Stage 1的E6-S checkpoint |
+| Teacher | 原始60-expert模型，完全冻结 |
+| Trainable experts | 每层3个super-experts |
+| Frozen | 12 protected experts、attention、router、shared expert、base weights |
+| Manifest | 必须与Student来自同一次压缩 |
+
+### 数据
+
+准备固定文件：
+
+```text
+artifacts/opd/openthought_math_code_32k.parquet
+```
+
+| 项目 | 设置 |
+|------|------|
+| 总量 | 32,000；Math 16,000 + Code 16,000 |
+| Train | 30,720 |
+| Validation | 1,280；Math/Code各640 |
+| Split seed | 42 |
+| 去重 | GSM8K、MATH-500、HumanEval(+)、MBPP(+)、LiveCodeBench exact + near dedup |
+
+运行前必须在本节回填准确的Hugging Face dataset ID、revision、prompt字段和reference-response字段，禁止使用浮动版本。
+
+### LoRA
+
+```yaml
+lora_rank: 32
+lora_alpha: 32
+lora_dropout: 0.0
+learning_rate: 3e-5
+target_projections: [gate_proj, up_proj, down_proj]
+target_experts_per_layer: 3 super-experts only
+```
+
+启动前打印并断言：
+
+```text
+每层恰好3个expert命中LoRA
+24层共72个expert实例命中LoRA
+protected/shared/router/attention均无trainable parameters
+完整trainable module names和parameter count已保存
+```
+
+### 联合loss
+
+Teacher-forced KD在OpenThought reference response上计算forward KL：
+
+```text
+L_KD = mean_response_tokens KL(p_teacher || p_student)
+```
+
+OPD在Student自己生成的response上计算现有K1 distillation loss：
+
+```text
+y_student ~ pi_student(. | prompt)
+L_OPD = mean_response_tokens K1(p_student, p_teacher; y_student)
+```
+
+总loss：
+
+```text
+progress   = global_step / total_steps
+lambda_kd  = 0.8 - 0.6 * progress
+lambda_opd = 1.0 - lambda_kd
+loss       = lambda_kd * L_KD + lambda_opd * L_OPD
+```
+
+开始时KD:OPD=0.8:0.2，结束时为0.2:0.8。两个loss必须分别按有效response token取均值，并分别记录到日志。
+
+### 单个optimizer step
+
+为降低显存，不同时保留两条计算图：
+
+```text
+KD microbatch：reference response → backward(lambda_kd * L_KD)
+OPD microbatch：student rollout → backward(lambda_opd * L_OPD)
+gradient accumulation完成 → optimizer.step()
+```
+
+两条microbatch使用相同domain mix，但不要求同一个prompt。不得把KD和OPD都计算在Student rollout上，否则两项监督退化为重复信号。
+
+### 8×H20配置
+
+```yaml
+GPUS: 0,1,2,3,4,5,6,7
+STUDENT_GPUS: 6       # FSDP actor + colocated rollout
+TEACHER_GPUS: 2
+ROLLOUT_TP: 2
+TEACHER_TP: 2
+ROLLOUT_MODE: sync
+FREE_CACHE_ENGINE: false
+PARAM_OFFLOAD: false
+OPTIMIZER_OFFLOAD: false
+LAYERED_SUMMON: false
+micro_batch_size: 1
+```
+
+20-step smoke：
+
+```yaml
+effective_batch_size: 4  # 2 KD + 2 OPD
+max_prompt_length: 256
+max_response_length: 256
+max_model_len: 513
+total_steps: 20
+```
+
+正式训练在smoke通过且显存允许后使用：
+
+```yaml
+effective_batch_size: 4  # 2 KD + 2 OPD；有余量再增至8
+max_prompt_length: 2048
+max_response_length: 1024
+max_model_len: 4096
+total_steps: 1200
+save_steps: [200, 400, 800, 1200]
+```
+
+### 训练记录与断点续训
+
+每次运行创建独立`run_id`目录，禁止复用目录覆盖旧实验。启动时保存一份不可变的`run_config.yaml`，至少记录：
+
+```text
+git commit和dirty diff
+完整启动命令、环境变量及软件版本
+student/teacher checkpoint路径与revision
+group_manifest.json的SHA256
+训练文件的SHA256、split seed和样本数
+LoRA配置、loss配置、batch/token长度、总步数和所有seed
+GPU型号/数量、hostname和开始时间
+trainable module names及参数量
+```
+
+训练过程按global step写入可追加的`metrics.jsonl`，至少记录：
+
+```text
+global_step、已处理的KD/OPD samples和有效tokens
+L_KD、L_OPD、lambda_kd、lambda_opd、total_loss
+learning_rate、grad_norm、rollout response length
+step time、累计wall time、tokens/s和各GPU峰值显存
+checkpoint保存/恢复事件及异常重试
+```
+
+必须支持resume。checkpoint至少包含LoRA/FSDP权重、optimizer、scheduler、`global_step`、随机数状态和data sampler进度；恢复后KD/OPD权重调度必须继续使用恢复出的`global_step / total_steps`，不得重新从0开始。使用verl原生`latest_checkpointed_iteration.txt`选择已完成的checkpoint，不另外维护第二套checkpoint格式。
+
+训练入口提供：
+
+```yaml
+RESUME_MODE: auto       # 默认寻找SAVE_DIR中最新的完整checkpoint
+RESUME_FROM: null       # 指定checkpoint时优先于auto
+SAVE_FREQ: 200
+KEEP_LAST: 2
+```
+
+`scripts/opd/run_qwen15_hc_lora_opd.sh`已接入verl原生`auto / disable / resume_path`，并支持`RESUME_FROM`和`KEEP_LAST`。正式训练前仍需完成GPU恢复验收：以`total_steps=20`启动，在step 10 checkpoint完整写入后终止作业，再用完全相同配置继续；确认从step 11继续、optimizer/LR/loss权重未重置、旧checkpoint未被覆盖，并成功生成step 20 checkpoint。受vLLM/Ray非确定性影响，不要求恢复后的rollout逐token完全一致。
+
+### 最小对照
+
+| ID | 方法 | 总训练步数 |
+|----|------|-----------:|
+| E6-0 | E6-S，无恢复 | 0 |
+| E6-O | Super-3 OPD-only | 1,200 |
+| E6-J | Super-3 Joint KD+OPD | 1,200 |
+
+第一轮只跑这三个。只有E6-J优于E6-O，才追加Random-3和All-15位置消融。除steps外还必须报告teacher/student tokens和GPU hours，避免联合loss因额外计算获得不公平优势。
+
+### 评测与判定
+
+与Exp #6 Stage 1使用完全相同的prompt template和benchmark。训练rollout的`MAX_RESP=1024`不限制final benchmark生成长度。
+
+报告gap recovery：
+
+```text
+Recovery = (Score_after - Score_E6-S)
+           / (Score_teacher - Score_E6-S) * 100%
+```
+
+核心判定：
+
+1. E6-J训练稳定，无乱码、重复循环或reward/loss爆炸；
+2. E6-J的GEN Avg高于E6-O；
+3. Math和Code均有恢复，MC-8不发生灾难性下降；
+4. 训练日志能够证明只有Super-3 LoRA收到梯度。
+
+**复用：** 从`scripts/opd/run_qwen15_hc_lora_opd.sh`派生最小入口；保留现有sync rollout和teacher inference，只新增精确expert LoRA选择、teacher-forced KD microbatch及loss schedule。
+
+**状态：** 未实现、未跑；依赖Exp #6 Stage 1通过停止线。
+
+---
+
+## Exp #6当前执行顺序
+
+1. 实现并自检12U+3M物理压缩、group router和manifest。
+2. 跑Exp #6 Stage 1无训练评测；未通过停止线则停止。
+3. 实现Super-3精确LoRA选择和Joint KD/OPD loss。
+4. 在8×H20上完成10→20 step resume smoke。
+5. smoke通过后跑E6-O与E6-J各1,200步并完成统一评测。
+
+当前不要追加更多compression ratio、router LoRA、attention LoRA、LoRA rank或数据配比消融。

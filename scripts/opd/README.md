@@ -66,6 +66,29 @@ bash scripts/opd/run_qwen15_hc_lora_opd.sh
 
 Recipe: `distillation.enabled=True`, `use_task_rewards=False`, sampled reverse-KL (`k1` + `use_policy_gradient=True`), `load_format=safetensors` for LoRA rollout. Student and teacher stay HF; no `torch_dist` convert.
 
+## Resume
+
+Resume defaults to `auto`: verl reads the latest complete checkpoint tracked under the same `SAVE_DIR`. Use a new `SAVE_DIR` or `RESUME_MODE=disable` for a fresh run.
+
+```bash
+# Auto-resume the latest checkpoint in SAVE_DIR.
+RESUME_MODE=auto SAVE_DIR=$PWD/artifacts/opd/exp6 \
+bash scripts/opd/run_qwen15_hc_lora_opd.sh
+
+# Resume one exact checkpoint. RESUME_FROM implies resume_path mode.
+RESUME_FROM=$PWD/artifacts/opd/exp6/global_step_200 \
+SAVE_DIR=$PWD/artifacts/opd/exp6 \
+bash scripts/opd/run_qwen15_hc_lora_opd.sh
+```
+
+Keep model/data/LoRA/batch settings and `TOTAL_STEPS` unchanged across the restart. `KEEP_LAST=2` controls actor checkpoint retention; use `KEEP_LAST=null` to retain all. The native verl checkpoint restores actor/LoRA, optimizer, scheduler, RNG/extra state, global step and dataloader state.
+
+Argument wiring can be checked without GPUs:
+
+```bash
+bash scripts/opd/test_lora_opd_resume.sh
+```
+
 ## Eval
 
 ```bash
