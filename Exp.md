@@ -776,3 +776,208 @@ Recovery = (Score_after - Score_E6-S)
 5. smoke通过后跑E6-O与E6-J各1,200步并完成统一评测。
 
 当前不要追加更多compression ratio、router LoRA、attention LoRA、LoRA rank或数据配比消融。
+
+---
+
+# Exp #7（2026-09-27）— 数学/代码上的剪枝融合与恢复训练
+
+> **最新调度：** Exp #7补齐数学与代码上的零训练压缩结果，并使用Exp #6 Stage 2的Joint KD+OPD基础设施比较恢复能力；MC-8保留为通用能力回归，不再作为主指标。
+
+**研究问题：** 在相同的75% expert压缩率下，`12U+3M`是否在数学推理和代码生成上稳定优于`REAP-15`、`REAM-15`和`HC-MoE-15`，并且能否只训练3个Super-Experts恢复主要性能？
+
+本实验包含两个部分：Stage A不训练，用于隔离压缩方法本身的贡献；Stage B使用统一Joint KD+OPD恢复，用于比较不同压缩初始化的可恢复性和Super-3局部训练的参数效率。
+
+## 对照方法
+
+| ID | 方法 | 每层结构 | 权重来源 |
+|----|------|----------|----------|
+| E7-T | Teacher | 60 routed experts | 原始Qwen1.5-MoE-A2.7B-Chat |
+| E7-RP | REAP-15 | REAP Top-15，其他45个直接删除 | 复用E6-P |
+| E7-RM | REAM-15 | REAP Top-15 centroids吸收其余45个experts | 新生成 |
+| E7-HC | HC-MoE-15（论文名HC-SMoE） | 输出相似度层次聚类成15组 | 新生成 |
+| E7-S | 12U+3M | 12 untouched + 3×(16→1) super-experts | 复用E6-S |
+
+五种模型必须来自同一份teacher并使用同一份calibration数据。若E6产物的`group_manifest.json`、模型revision或calibration hash不一致，则停止评测并按Exp #6 Stage 1重新生成；一致时禁止重复生成E7-RP和E7-S。
+
+### 基线实现口径
+
+- `REAP-15`：按REAP saliency保留每层Top-15 experts，同时删除其余45个expert权重和对应router rows。
+- `REAM-15`：使用完整REAM配置，`merge_size=15`、`saliency=reap`、`grouping=ream`、`merging=logits+weights`、`group_size=16`，启用gated-output similarity、gate-logit similarity和sequential layer-wise recalibration。Top-15为protected centroids，其余45个按pseudo-pruning贪心分配、神经元对齐后按saliency加权融合；按REAM定义删除非centroid router rows。
+- `HC-MoE-15`：遵循HC-SMoE基线，使用expert-output similarity、average-linkage hierarchical clustering、activation-based permutation alignment和frequency-weighted merging，将每层60个experts聚为15组；不使用REAP saliency选择centroid。
+
+REAM官方实现未直接覆盖Qwen1.5-MoE，因此移植后必须用小模型/单层数值检查验证分组、排列和融合公式，禁止用近似实现冒充REAM。HC-MoE若保留60个逻辑router slots，可将同组slot映射到同一个物理expert，但checkpoint中只能保存15份唯一expert权重；同时报告逻辑slots、唯一expert数和真实checkpoint大小。
+
+## 固定压缩设置
+
+| 项目 | 设置 |
+|------|------|
+| 模型 | `Qwen1.5-MoE-A2.7B-Chat` |
+| Calibration | NuminaMath 1,536 + The-Stack-Smol 1,536 |
+| Calibration长度 | 3,072 sequences × 512 tokens |
+| 压缩seed | 42 |
+| E7-RP | 每层按REAP saliency保留Top-15 |
+| E7-RM | 完整REAM pseudo-pruning，`merge_size=15, group_size=16` |
+| E7-HC | HC-SMoE average-linkage聚类成15组 |
+| E7-S | 每层保护Top-12，其余48个balanced clustering成3组并对齐融合 |
+| 最终物理experts | 四种压缩方法均为15/60；shared expert不参与压缩 |
+| Stage A训练 | 无 |
+
+第一轮只跑seed 42。若E7-S在`Math Avg`和`Code Avg`上都高于三个压缩基线中的最佳结果，再补压缩seed 43和44，最终报告3个seed的mean ± std；不要先扩展更多压缩比例。
+
+## 评测任务
+
+### 数学
+
+| Benchmark | Split | 指标 |
+|-----------|-------|------|
+| GSM8K | test | exact match；使用统一的flexible answer extraction |
+| MATH-500 | test | answer accuracy / pass@1 |
+
+### 代码
+
+| Benchmark | Split | 指标 |
+|-----------|-------|------|
+| HumanEval+ | test | EvalPlus pass@1 |
+| MBPP+ | test | EvalPlus pass@1 |
+| LiveCodeBench | 固定并记录release/date范围 | pass@1 |
+
+不得只报告E7-S。五种模型必须使用完全相同的数据版本、prompt template、答案抽取器、代码执行器和超时设置。
+
+## 统一生成设置
+
+当前grouped router未被vLLM原生支持，因此五种模型统一使用HF Transformers后端；禁止基线走vLLM而E7-S走HF。
+
+```yaml
+backend: hf
+dtype: bfloat16
+do_sample: false
+batch_size: 1
+max_input_length: 2048
+max_new_tokens: 1024
+seed: 42
+trust_remote_code: true
+```
+
+代码执行必须在隔离sandbox中设置单样本时间和内存限制。LiveCodeBench的数据release、评测日期及grader版本必须写入结果目录，禁止使用浮动latest版本。
+
+## Stage B：Joint KD+OPD恢复训练
+
+### 训练对照
+
+| ID | 初始化 | LoRA experts/layer | 目的 |
+|----|--------|-------------------:|------|
+| E7-RP-J15 | REAP-15 | 15 | 等参数恢复基线 |
+| E7-RM-J15 | REAM-15 | 15 | 等参数恢复基线 |
+| E7-HC-J15 | HC-MoE-15 | 15 | 等参数恢复基线 |
+| E7-S-J15 | 12U+3M | 15 | 12U+3M恢复上限及等参数比较 |
+| E7-S-J3 | 12U+3M | 3个Super-Experts | 提议的局部恢复方法 |
+
+`J15`四个实验必须具有相同LoRA rank和每层命中数量，用于公平比较压缩初始化。`E7-S-J3`只命中每层3个Super-Experts；不得命中12个untouched experts、router、attention或shared expert。OPD-only与Joint KD+OPD的loss消融由Exp #6完成，本实验不为每种压缩方法重复OPD-only。
+
+### 固定训练配置
+
+| 项目 | 设置 |
+|------|------|
+| Teacher | 原始60-expert模型，完全冻结 |
+| 数据 | `openthought_math_code_32k.parquet` |
+| Train / Validation | 30,720 / 1,280；Math与Code各半 |
+| LoRA | rank 32，alpha 32，dropout 0 |
+| Target projections | `gate_proj, up_proj, down_proj` |
+| Learning rate | `3e-5` |
+| Effective batch | 4；2个KD samples + 2个OPD samples |
+| 长度 | prompt 2,048；response 1,024；model length 4,096 |
+| 总步数 | 1,200 |
+| Checkpoints | 200、400、800、1,200；主结果固定使用step 1,200 |
+| 硬件 | 8×H20；6 student/rollout + 2 teacher，teacher TP=2 |
+| Resume | `RESUME_MODE=auto`，`KEEP_LAST=2` |
+
+使用与Exp #6完全相同的联合loss：
+
+```text
+progress   = global_step / 1200
+lambda_kd  = 0.8 - 0.6 * progress
+lambda_opd = 1.0 - lambda_kd
+loss       = lambda_kd * L_KD + lambda_opd * L_OPD
+```
+
+五个训练实验必须使用相同的数据顺序、seed、有效KD/OPD tokens和optimizer steps。除最终分数外，报告trainable parameters、teacher/student tokens、GPU hours和峰值显存；不得用更多rollout或更长训练为某个方法单独调参。
+
+### 训练前置验收
+
+grouped router当前未被vLLM原生支持。正式训练前必须让E7-S在训练rollout后端正确执行grouped-router逻辑，并在20个固定prompts上与HF前向核对生成及next-token logits；未通过一致性检查时不得启动E7-S-J3/J15，也不得用标准15-row router替换后宣称为同一方法。
+
+所有训练方法统一使用同一个sync rollout后端。先完成20-step smoke和`step 10 → resume → step 20`恢复测试，确认optimizer、global step、loss权重调度和LoRA模块命中均正确。
+
+## 运行顺序
+
+1. 校验五个checkpoint、tokenizer、chat template、manifest和数据hash，并断言四个压缩模型每层只有15份唯一expert权重。
+2. 每个模型先在每个benchmark上运行20条smoke，检查乱码、重复生成、答案抽取和代码执行。
+3. 完整运行五种模型的GSM8K和MATH-500。
+4. 完整运行五种模型的HumanEval+、MBPP+和LiveCodeBench。
+5. 完成rollout grouped-router一致性、20-step训练和resume验收。
+6. 运行E7-RP-J15、E7-RM-J15、E7-HC-J15、E7-S-J15和E7-S-J3各1,200步。
+7. 使用完全相同的数学/代码评测配置测试step 1,200，并复测MC-8检查通用能力回退。
+8. 汇总seed 42；零训练和训练结果均为正信号后，再对关键对照补seed 43、44。
+
+## 报告指标
+
+分别报告，不用一个总平均掩盖领域差异：
+
+```text
+Math Avg = mean(GSM8K, MATH-500)
+Code Avg = mean(HumanEval+, MBPP+, LiveCodeBench)
+```
+
+每个任务同时报告相对纯剪枝恢复的teacher gap：
+
+```text
+Recovery_task = (Score_E7-S - Score_E7-RP)
+                / (Score_E7-T - Score_E7-RP) * 100%
+```
+
+Recovery固定以REAP-15为参照。另报告E7-S相对三个压缩基线最佳值的绝对差`Delta_best`；若Recovery分母小于等于0，则该任务只报告绝对差值。
+
+训练后的恢复率以每种方法自己的零训练checkpoint为起点：
+
+```text
+TrainRecovery(m, task) = (Score_trained(m) - Score_zero(m))
+                         / (Score_teacher - Score_zero(m)) * 100%
+```
+
+若teacher不高于对应零训练模型，则只报告训练前后绝对差值。
+
+### 结果表（完成后回填）
+
+| Method | GSM8K | MATH-500 | Math Avg | HumanEval+ | MBPP+ | LiveCodeBench | Code Avg |
+|--------|------:|---------:|---------:|-----------:|------:|--------------:|---------:|
+| E7-T Teacher | | | | | | | |
+| E7-RP REAP-15 | | | | | | | |
+| E7-RM REAM-15 | | | | | | | |
+| E7-HC HC-MoE-15 | | | | | | | |
+| E7-S 12U+3M | | | | | | | |
+| E7-S − best baseline | | | | | | | |
+
+### 训练结果表（完成后回填）
+
+| Method | LoRA experts/layer | Trainable params | Math Avg | Code Avg | MC Avg | TrainRecovery Math | TrainRecovery Code | GPU hours |
+|--------|-------------------:|-----------------:|---------:|---------:|-------:|-------------------:|-------------------:|----------:|
+| E7-RP-J15 | 15 | | | | | | | |
+| E7-RM-J15 | 15 | | | | | | | |
+| E7-HC-J15 | 15 | | | | | | | |
+| E7-S-J15 | 15 | | | | | | | |
+| E7-S-J3 | 3 | | | | | | | |
+
+## 判定
+
+1. `E7-S > E7-RP`：12U+3M比纯REAP剪枝保留更多目标领域能力；
+2. `E7-S > E7-RM`且`E7-S > E7-HC`：优势不是“任何融合都有效”，而来自12U+3M的保护与均衡融合设计；
+3. E7-S在Math Avg和Code Avg上都超过三个压缩基线：MC-8优势迁移到论文目标领域，可以启动Super-3恢复训练；
+4. 只在一个领域成立：报告领域偏置，并检查mixed calibration比例，不得宣称数学和代码均有效；
+5. 两项均未超过最佳基线：Exp #6的MC-8正信号不能支撑论文主结论，先检查grouped router和融合实现，再决定是否训练。
+6. `E7-S-J15`超过其他`J15`：12U+3M不仅零训练更强，而且在相同训练参数预算下更容易恢复；
+7. `E7-S-J3`接近或超过最佳`J15`基线：仅训练3个受融合影响的experts具有更高参数效率；
+8. 所有方法训练后相近：主要收益来自Joint KD+OPD，而不是压缩初始化，论文不得把恢复增益全部归因于12U+3M。
+
+**产出：** 五种零训练模型和五个训练run的逐任务原始输出、grader结果、Math/Code汇总表、gap recovery、训练日志、LoRA checkpoints、运行时间、GPU hours、峰值显存、唯一expert数、真实checkpoint大小及数据hash；代码任务额外保存每个样本的编译/运行状态。
+
+**状态：** 未跑；E6-P/E6-S可复用为E7-RP/E7-S，REAM-15和HC-MoE-15尚需生成；HF版代码评测适配、训练rollout grouped-router支持及Joint KD+OPD实现尚需完成。
