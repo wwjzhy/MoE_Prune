@@ -980,4 +980,110 @@ TrainRecovery(m, task) = (Score_trained(m) - Score_zero(m))
 
 **产出：** 五种零训练模型和五个训练run的逐任务原始输出、grader结果、Math/Code汇总表、gap recovery、训练日志、LoRA checkpoints、运行时间、GPU hours、峰值显存、唯一expert数、真实checkpoint大小及数据hash；代码任务额外保存每个样本的编译/运行状态。
 
-**状态：** 未跑；E6-P/E6-S可复用为E7-RP/E7-S，REAM-15和HC-MoE-15尚需生成；HF版代码评测适配、训练rollout grouped-router支持及Joint KD+OPD实现尚需完成。
+**已保存样例：** `results/exp7_rollout_samples_2026-09-29.txt`（E7-T、E7-RP、E7-RM、E7-HC、E7-S的原始rollout，保留截断、空输出与乱码）。
+
+**状态：** 已完成一轮定性rollout；正式benchmark、grader与训练尚未完成。E6-P/E6-S可复用为E7-RP/E7-S，REAM-15和HC-MoE-15尚需生成；HF版代码评测适配、训练rollout grouped-router支持及Joint KD+OPD实现尚需完成。
+
+---
+
+# Exp #8（2026-10-01）— 低 Expert 保留率曲线（优先 50% Retention）
+
+> **当前最高优先级：** 先完成 `R50`（每层保留30/60 experts）的零训练压缩与评测。Exp #8不启动LoRA、KD或OPD；只测Stage 1。已有checkpoint和统计量能够复用时禁止重复生成。
+
+## 研究问题
+
+随着最终物理expert数量减少，`Protected + Residual Merging`相对纯剪枝和已有融合方法的优势是否持续，并定位模型从稳定到坍缩的retention拐点？
+
+本文统一使用：
+
+```text
+retention ratio   = 最终物理expert数 / 60
+compression ratio = 1 - retention ratio
+```
+
+因此本节的`R50`表示保留30/60、压缩50%，不是“保留50%后再压缩50%”。
+
+## Retention点与本文结构
+
+| ID | Retention | Compression | 最终experts/layer | 本文结构 | 状态 |
+|----|----------:|------------:|--------------------:|----------|------|
+| R50 | 50% | 50% | 30 | `24U+6M`；剩余36个分成6组，每组6个 | **第一优先级** |
+| R33 | 33.33% | 66.67% | 20 | `16U+4M`；剩余44个分成4组，每组11个 | R50完成后运行 |
+| R25 | 25% | 75% | 15 | `12U+3M`；剩余48个分成3组，每组16个 | Exp #6/#7已有mixed-calibration参考结果；域专用曲线需重跑 |
+
+暂不把13.33%（8/60）放入主曲线：当前25%时部分基线已经接近任务下限，继续压缩会产生无法区分方法的floor effect。只有当Ours在R25仍保持有效生成和明显非零能力，或Stage 2能显著恢复R25时，才把`6U+2M`作为附录stress test。3/60=5%也不运行，因为3个物理experts小于原模型Top-4，会改变路由定义，不能与其它点直接比较。
+
+## 为什么主曲线暂时止于25%
+
+现有post-hoc expert压缩通常止于25% retention或更高：REAM主要报告75%/50% retention；EEP报告过25% retention；Generic TB-Coverage在Qwen1.5-MoE上报告25%/50%/75% retention。低于25%的代表性结果主要来自为模块化专门预训练的EMO（12.5%和6.25% expert subset），与本文对现成MoE进行post-hoc压缩的设置不同。因此主曲线先用R50、R33、R25定位坍缩拐点，不为了追求更低数字而运行缺乏区分度的R13。
+
+参考：
+
+- REAM: https://arxiv.org/abs/2604.04356
+- EEP: https://arxiv.org/abs/2407.00945
+- Generic TB-Coverage: https://arxiv.org/abs/2607.01710
+- EMO: https://arxiv.org/abs/2605.06663
+
+## Benchmark与域专用Calibration
+
+不同benchmark域使用不同的calibration checkpoint，但同一个benchmark域内所有方法必须使用完全相同的calibration文件、样本顺序、tokenizer、长度、seed和hash。禁止使用benchmark test/validation样本做calibration。
+
+| Track | Calibration `D_cal` | 数量与长度 | Evaluation |
+|-------|---------------------|------------|------------|
+| General | C4 | 3,072 sequences × 512 tokens | MC-8 |
+| Math | NuminaMath | 3,072 sequences × 512 tokens | GSM8K、MATH-500 |
+| Code | The-Stack-Smol | 3,072 sequences × 512 tokens | HumanEval+、MBPP+、LiveCodeBench |
+
+三个track分别画曲线，不允许把使用不同calibration checkpoint得到的General、Math、Code分数混成一个总体平均。每个calibration文件固定revision、预处理脚本、seed 42并保存SHA256；Math/Code calibration继续执行与Exp #7相同的benchmark去重规则。
+
+## 对照方法
+
+第一轮使用当前仓库已有且可复现的四种方法：
+
+| ID | 方法 | R50目标 | R33目标 | R25目标 |
+|----|------|--------:|--------:|--------:|
+| RP | REAP | 30 | 20 | 15 |
+| RM | REAM | 30 | 20 | 15 |
+| HC | HC-SMoE | 30 | 20 | 15 |
+| S | Ours | `24U+6M` | `16U+4M` | `12U+3M` |
+
+所有方法均使用相同teacher、同一track的`D_cal`和相同最终物理expert数。shared expert不压缩。EEP与DM-MoE暂不阻塞R50；主曲线跑通后再作为强基线补入，禁止用近似实现冒充官方方法。
+
+## R50立即执行顺序
+
+1. 生成并冻结General、Math、Code三个calibration文件，记录dataset ID、revision、行数和SHA256。
+2. 对每个track先生成Ours `24U+6M`，逐层断言：24个protected、6个merge groups、每组6个source experts、全集覆盖且互不相交、物理expert数为30。
+3. 每个checkpoint先在对应track运行20条smoke；检查乱码、重复输出、答案抽取和代码sandbox。
+4. Ours smoke通过后，使用完全相同的calibration文件生成REAP-30、REAM-30和HC-SMoE-30。
+5. 完整评测对应track；保存逐样本输出、逐任务分数、checkpoint大小、峰值显存、压缩wall time和manifest。
+6. 三个track的R50均完成后依次运行R33和R25域专用checkpoint。Exp #6/#7的mixed-calibration R25只作sanity reference，不与域专用R50/R33连成同一条曲线。
+
+## 曲线与结果表
+
+横轴统一使用真实retention：`50%`、`33.33%`、`25%`；纵轴分别绘制`MC Avg`、`Math Avg`和`Code Avg`。每张图只包含对应域专用calibration的结果。
+
+| Track | Method | R50 | R33 | R25 |
+|-------|--------|----:|----:|----:|
+| General / MC Avg | REAP | | | |
+|  | REAM | | | |
+|  | HC-SMoE | | | |
+|  | Ours | | | |
+| Math / Math Avg | REAP | | | |
+|  | REAM | | | |
+|  | HC-SMoE | | | |
+|  | Ours | | | |
+| Code / Code Avg | REAP | | | |
+|  | REAM | | | |
+|  | HC-SMoE | | | |
+|  | Ours | | | |
+
+## 停止线
+
+1. R50的Ours若低于同track的REAP，先检查saliency、balanced grouping、neuron alignment和group router，不启动R33。
+2. R33正常但R25出现乱码或输出崩溃，先验证Top-4 group routing及物理expert映射；实现正确后仍崩溃则如实报告方法边界。
+3. Ours只有在General、Math、Code三条曲线中的至少两条持续优于最佳压缩基线，才能声称低retention优势。
+4. Exp #8全程不训练；Stage 2是否保留由Exp #8零训练曲线和单次Joint KD+OPD去留实验另行决定。
+
+**产出：** 三份冻结calibration数据及hash、R50/R33/R25的域专用压缩checkpoints、group manifests、逐任务原始输出与grader结果、三张retention曲线、真实checkpoint大小、压缩时间和峰值显存。
+
+**状态：** 已设计，未运行。当前只批准先跑R50：`General→Math→Code`，且每个track先Ours后基线。
