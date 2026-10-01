@@ -1087,3 +1087,146 @@ compression ratio = 1 - retention ratio
 **产出：** 三份冻结calibration数据及hash、R50/R33/R25的域专用压缩checkpoints、group manifests、逐任务原始输出与grader结果、三张retention曲线、真实checkpoint大小、压缩时间和峰值显存。
 
 **状态：** 已设计，未运行。当前只批准先跑R50：`General→Math→Code`，且每个track先Ours后基线。
+
+---
+
+# Exp #9（2026-10-01）— W4A16量化兼容性：REAP、REAM与Ours
+
+> **目标：** 验证Expert压缩后的模型能否继续进行post-training weight quantization，以及Ours在量化后是否仍保持相对REAP/REAM的优势。本实验只做量化与评测，不重新压缩、不训练、不运行KD/OPD。
+
+## 与Exp #8的关系
+
+Exp #8已经负责生成和评测BF16下的R50、R33、R25压缩模型。Exp #9只复用其中R50与R25的checkpoint及BF16结果：
+
+```text
+BF16压缩与评测：Exp #8
+      ↓ 复用相同checkpoint
+W4A16 GPTQ量化：Exp #9
+      ↓
+相同benchmark复测并计算quantization drop
+```
+
+若某个Exp #8条件尚未完成，则先补齐对应BF16结果；checkpoint、manifest、tokenizer、chat template和评测版本一致时禁止重复运行BF16评测。R33不进入Exp #9，避免把兼容性实验扩成第二条完整retention曲线。
+
+## 实验矩阵
+
+| ID | 方法 | Retention | 来源checkpoint | 精度 |
+|----|------|----------:|----------------|------|
+| E9-T-Q | Teacher | 100% | 原始60-expert模型 | W4A16 |
+| E9-RP50-Q | REAP | 50%（30/60） | Exp #8 REAP-R50 | W4A16 |
+| E9-RM50-Q | REAM | 50%（30/60） | Exp #8 REAM-R50 | W4A16 |
+| E9-S50-Q | Ours | 50%（`24U+6M`） | Exp #8 Ours-R50 | W4A16 |
+| E9-RP25-Q | REAP | 25%（15/60） | Exp #8 REAP-R25 | W4A16 |
+| E9-RM25-Q | REAM | 25%（15/60） | Exp #8 REAM-R25 | W4A16 |
+| E9-S25-Q | Ours | 25%（`12U+3M`） | Exp #8 Ours-R25 | W4A16 |
+
+`E9-T-Q`只量化一次，作为未压缩量化参考。HC-SMoE与R33不进入本实验；Exp #9的核心比较是在相同retention和量化设置下比较REAP、REAM与Ours。
+
+## 固定量化设置
+
+第一轮只使用GPTQ，禁止为不同方法分别选择量化器或超参数。
+
+```yaml
+quantizer: GPTQModel
+weight_bits: 4
+activation_dtype: bfloat16
+group_size: 128
+sym: true
+desc_act: false
+quant_calibration: C4
+num_calibration_sequences: 128
+sequence_length: 2048
+seed: 42
+```
+
+- 量化所有受支持的`Linear`权重，包括attention、routed experts与shared expert；router gate、normalization、embedding和`lm_head`保持BF16。
+- Ours必须保留Exp #8的group manifest与grouped-router逻辑；不得把group router替换为普通15/30-row router。
+- 所有条件使用同一份冻结C4量化校准文件、相同样本顺序、tokenizer和SHA256。该量化校准集独立于Exp #8用于expert选择/融合的域专用calibration set。
+- 量化前统计每个物理expert获得的校准token数。若任一条件存在零命中expert，则统一把校准集扩展到512条并从头量化全部条件，禁止只给某个方法增加校准数据。
+- 保存量化日志，并核对每个checkpoint的实际4-bit模块数量；若某类expert权重被静默跳过，该run无效。
+
+## Benchmark与非量化对照
+
+量化模型必须复用对应Exp #8 track的压缩checkpoint并在同一track上评测：
+
+| Track | BF16结果来源 | 量化后评测 |
+|-------|--------------|------------|
+| General | Exp #8 C4-calibrated checkpoint | MC-8 |
+| Math | Exp #8 NuminaMath-calibrated checkpoint | GSM8K、MATH-500 |
+| Code | Exp #8 The-Stack-Smol-calibrated checkpoint | HumanEval+、MBPP+、LiveCodeBench |
+
+同一个BF16 checkpoint与其W4A16版本必须使用完全相同的prompt、生成参数、答案抽取器、grader和数据版本。所有模型统一使用HF Transformers后端；在grouped router未获得相同量化kernel支持前，不报告跨后端吞吐对比。
+
+第一优先级先完成General track的7个量化模型。General结果有效后，再量化Math与Code对应的6个压缩checkpoint；Teacher量化checkpoint可在三个track间复用。
+
+## 指标
+
+除量化后原始分数外，对每个方法、retention与任务计算：
+
+```text
+QuantDrop(m, task) = Score_W4A16(m, task) - Score_BF16(m, task)
+```
+
+同时报告：
+
+1. W4A16与对应BF16的逐任务绝对差；
+2. Ours相对同retention下最佳量化基线的差值：
+
+```text
+Delta_best_Q = Score_W4A16(Ours) - max(Score_W4A16(REAP), Score_W4A16(REAM))
+```
+
+3. checkpoint磁盘大小、加载后峰值GPU显存、量化wall time；
+4. 每层最终物理expert数、唯一expert权重数和实际被量化模块数。
+
+## 运行顺序
+
+1. 从Exp #8读取General track的Teacher、REAP-R50/R25、REAM-R50/R25和Ours-R50/R25，并校验checkpoint与manifest hash。
+2. 冻结128条C4量化校准数据，先运行`E9-T-Q`和`E9-S50-Q`的量化及20条MC smoke。
+3. smoke通过后完成General track其余五个量化模型及MC-8完整评测。
+4. 比较对应Exp #8 BF16结果，生成R50/R25的`Score_W4A16`、`QuantDrop`与`Delta_best_Q`。
+5. General未发生实现性崩溃后，以同样流程完成Math与Code track；Teacher量化模型不重复生成。
+6. 仅当主结果需要补充时，对`Teacher、REAM-R50、Ours-R50`增加W8A16或AWQ消融；该消融不阻塞Exp #9主结果。
+
+## 结果表（完成后回填）
+
+### General
+
+| Method | Retention | BF16 MC Avg（Exp #8） | W4A16 MC Avg | QuantDrop | Checkpoint GB | Peak VRAM GB |
+|--------|----------:|----------------------:|-------------:|----------:|--------------:|-------------:|
+| Teacher | 100% | | | | | |
+| REAP | 50% | | | | | |
+| REAM | 50% | | | | | |
+| Ours | 50% | | | | | |
+| REAP | 25% | | | | | |
+| REAM | 25% | | | | | |
+| Ours | 25% | | | | | |
+
+### Math与Code
+
+| Track | Method | Retention | BF16 Avg（Exp #8） | W4A16 Avg | QuantDrop | Delta best Q |
+|-------|--------|----------:|-------------------:|-----------:|----------:|-------------:|
+| Math | REAP | 50% | | | | |
+| Math | REAM | 50% | | | | |
+| Math | Ours | 50% | | | | |
+| Math | REAP | 25% | | | | |
+| Math | REAM | 25% | | | | |
+| Math | Ours | 25% | | | | |
+| Code | REAP | 50% | | | | |
+| Code | REAM | 50% | | | | |
+| Code | Ours | 50% | | | | |
+| Code | REAP | 25% | | | | |
+| Code | REAM | 25% | | | | |
+| Code | Ours | 25% | | | | |
+
+## 判定与停止线
+
+1. Ours在R50和R25量化后仍高于同retention的REAP与REAM，且`QuantDrop`没有显著大于两者：说明本文压缩结果与4-bit weight-only量化兼容。
+2. Ours的BF16优势在W4A16后消失，但三种方法的`QuantDrop`接近：结论应写为量化噪声缩小方法差异，不能声称量化兼容性优势。
+3. Ours的`QuantDrop`明显更大：优先检查Super-Expert权重范围、异常值和grouped-router量化模块覆盖；修复实现前不得归因于方法本身。
+4. R50正常而R25量化后坍缩：将R25报告为极低retention下量化的失败边界，不为单个方法调节bit-width或校准集。
+5. `E9-T-Q`也严重下降：先检查GPTQ实现、chat template和评测环境，暂停全部压缩模型量化。
+
+**产出：** 量化校准文件及SHA256、7个General量化checkpoint、12个Math/Code域专用量化checkpoint、量化配置与日志、逐任务原始输出、BF16/W4A16对照表、checkpoint大小、峰值显存、量化时间、expert token coverage与实际量化模块清单。
+
+**状态：** 已设计，未运行。先执行General：`Teacher → Ours-R50 smoke → REAP/REAM-R50 → Ours/REAP/REAM-R25`；General通过后再运行Math与Code。
