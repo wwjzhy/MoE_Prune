@@ -1230,3 +1230,229 @@ Delta_best_Q = Score_W4A16(Ours) - max(Score_W4A16(REAP), Score_W4A16(REAM))
 **产出：** 量化校准文件及SHA256、7个General量化checkpoint、12个Math/Code域专用量化checkpoint、量化配置与日志、逐任务原始输出、BF16/W4A16对照表、checkpoint大小、峰值显存、量化时间、expert token coverage与实际量化模块清单。
 
 **状态：** 已设计，未运行。先执行General：`Teacher → Ours-R50 smoke → REAP/REAM-R50 → Ours/REAP/REAM-R25`；General通过后再运行Math与Code。
+
+---
+
+# Exp #10（2026-10-06）— Figure 1 失败机制：Functional Drop 与 Salient-Expert Drift
+
+> **目标：** 用GSM8K上的三张子图验证极低expert retention下的两个互补问题：纯剪枝造成全局功能丢失，直接把source experts融合进高重要性experts会改变其原有函数。本文方法应同时降低整体输出偏差，并避免显著expert发生漂移。本实验只分析Stage 1，不训练、不运行KD/OPD/LoRA。
+
+## 研究问题与图结构
+
+Figure 1固定为三个panel，不再增加第三种drift：
+
+| Panel | 横轴 | 纵轴 | 回答的问题 |
+|-------|------|------|------------|
+| (a) Pruning-induced functional drop | Retention：100%、50%、33.3%、25%、13.3%（图中从高到低排列） | $D_{\mathrm{drop}}\downarrow$ | retention降低时，纯剪枝是否持续丢失原模型功能？ |
+| (b) Merge-induced salient-expert drift | 每个显著expert吸收的source expert数 $m\in\{0,1,2,3,4,6\}$ | $D_{\mathrm{drift}}\downarrow$ | 即使融合功能最相近的source experts，原显著expert是否随merge load增加而漂移？ |
+| (c) Fixed-budget mechanism map | $D_{\mathrm{comp}}\downarrow$ | $D_{\mathrm{drift}}\downarrow$ | 在25% retention下，REAP、REAM与Ours分别落在“信息丢失—显著expert干扰”的什么位置？ |
+
+Panel (c)的每个方法点旁标注GSM8K accuracy；左下角更好。`D_drop`只用于纯剪枝。跨REAP、REAM和Ours比较时必须使用更一般的`D_comp`，不得把merge方法的整体偏差写成`D_drop`。
+
+## 固定模型与数据
+
+| 项目 | 设置 |
+|------|------|
+| Teacher / Original MoE | `Qwen1.5-MoE-A2.7B-Chat`，BF16、eval mode |
+| 分析对象 | 全部24个MoE层的60个routed experts；shared expert保持原样并从三个偏差指标中排除 |
+| Compression calibration $\mathcal D_{cal}$ | GSM8K train固定3,072题，seed 42 |
+| Mechanism diagnostic $\mathcal D_{diag}$ | 与$\mathcal D_{cal}$不重叠的GSM8K train固定512题 |
+| End-to-end evaluation $\mathcal D_{test}$ | GSM8K official test全部1,319题 |
+| 校准/诊断序列 | `question + gold reasoning + gold answer`，teacher forcing，截断到512 tokens |
+| 生成评测 | 沿用Exp #7：HF Transformers、BF16、greedy、`max_input_length=2048`、`max_new_tokens=1024` |
+
+`calibration.jsonl`、`diagnostic.jsonl`和测试集版本必须保存dataset revision、原始样本ID、预处理脚本版本与SHA256。三个集合不得重叠；official test不得参与saliency、grouping、merging或阈值选择。所有方法必须共享同一份tokenizer、chat template、$\mathcal D_{cal}$和$\mathcal D_{diag}$。
+
+第一轮只使用compression seed 42。图中误差条来自对诊断样本或layer-expert pair的1,000次bootstrap，而不是把token当作独立样本。若Figure 1进入主文并据此声称结果对expert选择稳定，再补seed 43、44并报告跨seed mean $\pm$ std。
+
+## 统一前向口径
+
+对每个$x\in\mathcal D_{diag}$，先用Original MoE做一次teacher-forced前向并缓存：
+
+```text
+h[l, x, t]       = Original MoE进入第l个MoE block前的hidden state
+router[l, x, t]  = Original router logits、Top-K ids与weights
+Y0[l, x, t]      = Original routed-expert branch的聚合输出
+```
+
+计算所有方法的偏差时都喂入相同的`h[l,x,t]`，禁止让不同压缩模型各自滚动产生hidden state。这样测量的是当前MoE层压缩造成的局部函数变化，而不是把前层误差重复累计。`Y`只包含routed-expert branch；shared expert、residual connection和attention不进入分子或分母。
+
+统计统一使用FP32累加，$\epsilon=10^{-8}$。先计算每个独立单位的归一化偏差，再做macro average；禁止先平均向量，也禁止把高频expert的大量tokens直接pool成一个全局ratio。
+
+## 指标一：Pruning-induced Functional Drop
+
+对retention $r$的REAP纯剪枝模型，在Original hidden states上定义：
+
+$$
+d_{\mathrm{drop}}^{(x,l)}(r)=
+\frac{\sum_t\left\|Y_l^0(h_{l,x,t})-Y_l^{\mathrm{prune}(r)}(h_{l,x,t})\right\|_2^2}
+{\sum_t\left\|Y_l^0(h_{l,x,t})\right\|_2^2+\epsilon},
+$$
+
+$$
+D_{\mathrm{drop}}(r)=
+\frac{1}{|\mathcal D_{diag}|\,|\mathcal L|}
+\sum_{x\in\mathcal D_{diag}}\sum_{l\in\mathcal L}
+d_{\mathrm{drop}}^{(x,l)}(r).
+$$
+
+运行`60/60、30/60、20/60、15/60、8/60`五个点。除`60/60`外，每层均按同一份REAP saliency保留Top-$K$，并严格使用REAP实际的router-row删除与重新归一化逻辑。Panel (a)画mean与95% bootstrap CI；同时保存被删除experts承接的Original router mass，作为diagnostic，不放入主图：
+
+$$
+R_{\mathrm{drop}}(r)=
+\mathbb E_{l,x,t}\left[\sum_{i\in\mathcal R_l(r)}p^0_{l,i}(h_{l,x,t})\right].
+$$
+
+## 指标二：Merge-induced Salient-Expert Drift
+
+每层用Original MoE的REAP saliency固定Top-12显著expert集合$\mathcal P_l$。对每个$i\in\mathcal P_l$，从$\mathcal D_{diag}$收集被Original router Top-K路由到$i$的hidden states，固定最多256个tokens，记为$\mathcal H_{l,i}$。若任一layer-expert pair不足128个tokens，则把所有panel共用的$\mathcal D_{diag}$统一扩展到1,024道不重叠GSM8K-train样本并从头重算；不能只为某个expert扩数据，更不能使用test补齐。
+
+对每个显著expert，仅把REAP saliency rank 16--60、即REAM-15会删除的45个experts作为source候选，并按REAM使用的functional similarity从高到低排序。对$m\in\{0,1,2,3,4,6\}$，取最相近的$m$个source experts，使用REAM完全相同的neuron alignment与saliency-weighted fusion生成$\widetilde E_{l,i}^{(m)}$。这是单expert受控stress test；不同$i$之间允许复用source候选，不保存为完整压缩checkpoint。$m=3$对应15/60 retention时每个REAM centroid平均吸收3个source experts的负载。
+
+先对每个layer-expert pair计算：
+
+$$
+d_{\mathrm{drift}}^{(l,i)}(m)=
+\frac{\sum_{h\in\mathcal H_{l,i}}
+\left\|E^0_{l,i}(h)-\widetilde E_{l,i}^{(m)}(h)\right\|_2^2}
+{\sum_{h\in\mathcal H_{l,i}}\left\|E^0_{l,i}(h)\right\|_2^2+\epsilon},
+$$
+
+再对所有显著expert等权平均：
+
+$$
+D_{\mathrm{drift}}(m)=
+\frac{1}{\sum_l|\mathcal P_l|}
+\sum_l\sum_{i\in\mathcal P_l}d_{\mathrm{drift}}^{(l,i)}(m).
+$$
+
+Panel (b)画REAM式in-place merge的mean与95% bootstrap CI；另外用蓝色虚线标出Ours protected experts的$D_{\mathrm{drift}}=0$参考线。该虚线只表达“Ours从不把source expert融合进protected expert”，不是同一$m$下的第二条merge曲线。
+
+## 指标三：25% Retention下的二维机制图
+
+只比较三个零训练checkpoint，全部来自本实验同一份GSM8K calibration：
+
+| ID | 方法 | 每层最终结构 | 作用 |
+|----|------|--------------|------|
+| E10-RP15 | REAP-15 | Top-15原expert，删除其余45个 | 纯剪枝参考 |
+| E10-RM15 | REAM-15 | Top-15 centroids吸收其余45个 | in-place merge参考 |
+| E10-S15 | Ours | `12 protected + 3 super`，其余48个只融合进3个super experts | 本文方法 |
+
+三个模型均为15/60=25% retention，shared expert不变，不训练。全局压缩输出偏差定义为：
+
+$$
+d_{\mathrm{comp}}^{(x,l)}(M)=
+\frac{\sum_t\left\|Y_l^0(h_{l,x,t})-Y_l^M(h_{l,x,t})\right\|_2^2}
+{\sum_t\left\|Y_l^0(h_{l,x,t})\right\|_2^2+\epsilon},
+$$
+
+$$
+D_{\mathrm{comp}}(M)=
+\frac{1}{|\mathcal D_{diag}|\,|\mathcal L|}
+\sum_{x,l}d_{\mathrm{comp}}^{(x,l)}(M).
+$$
+
+三个方法的$D_{\mathrm{drift}}(M)$统一在Original Top-12集合$\mathcal P_l$上计算：
+
+$$
+D_{\mathrm{drift}}(M)=
+\frac{1}{\sum_l|\mathcal P_l|}
+\sum_l\sum_{i\in\mathcal P_l}
+\frac{\sum_{h\in\mathcal H_{l,i}}
+\left\|E^0_{l,i}(h)-\widetilde E^M_{l,\pi_M(i)}(h)\right\|_2^2}
+{\sum_{h\in\mathcal H_{l,i}}\left\|E^0_{l,i}(h)\right\|_2^2+\epsilon}.
+$$
+
+$\pi_M(i)$由method manifest给出Original显著expert到压缩后expert的映射。对REAP-15和Ours，Top-12权重保持不变，因此$\pi_M(i)=i$且理论上$D_{\mathrm{drift}}\approx0$；REAM-15使用被融合后的对应centroid。该共同Top-12集合不得按方法分别选择，否则纵轴不可比较。
+
+Panel (c)以`D_comp`为横轴、`D_drift`为纵轴，二者都越低越好；每个点标注GSM8K flexible exact-match，误差条分别对prompt和layer-expert pair做bootstrap。Original MoE只作为$(0,0)$灰色参考，不计入三方法比较。
+
+## GSM8K评测与Figure 1制图
+
+Original MoE、E10-RP15、E10-RM15、E10-S15在official test上使用完全相同的greedy generation、prompt template与answer extractor。主标注使用Exp #7的flexible exact-match，同时保存strict exact-match、逐题response、抽取答案和正确性。
+
+Figure 1统一使用色盲安全配色：
+
+```text
+REAP  #D55E00  orange-red
+REAM  #CC79A7  pink
+Ours  #0072B2  blue
+Original / reference  #7A7A7A  gray
+```
+
+除颜色外，REAP/REAM/Ours分别使用`circle/triangle/star` marker，保证灰度打印可区分。输出vector PDF和300-dpi PNG；三个panel共享字体、线宽和字号。Panel (c)左下角标注`Lower is better`，不要用面积、颜色深浅或第三坐标重复编码accuracy。
+
+## 运行顺序
+
+1. 冻结$\mathcal D_{cal}$、$\mathcal D_{diag}$与GSM8K test manifest，检查样本ID零重叠并保存SHA256。
+2. 复测Original MoE的GSM8K；若与Exp #7同配置结果相差超过1.0个绝对百分点，先修复prompt/evaluator，禁止继续。
+3. 缓存Original MoE的hidden states、router信息和routed-branch outputs；完成`Original→Original`数值自检。
+4. 运行Panel (a)五个REAP retention点并计算$D_{\mathrm{drop}}$与removed router mass。
+5. 运行Panel (b)六个merge-load点；只做局部expert forward，不生成六份完整模型。
+6. 生成或复用同hash的E10-RP15、E10-RM15、E10-S15，计算Panel (c)的$D_{\mathrm{comp}}$和共同Top-12上的$D_{\mathrm{drift}}$。
+7. 对三个25%模型运行完整GSM8K test，并把accuracy标到Panel (c)。
+8. 做1,000次bootstrap、导出Figure 1 PDF/PNG和全部raw metrics。
+
+## 数值验收与结论边界
+
+1. `Original→Original`的$D_{\mathrm{drop}}$、$D_{\mathrm{comp}}$和$D_{\mathrm{drift}}$必须小于$10^{-8}$；Panel (a)的100% retention及Panel (b)的$m=0$也必须满足该条件。
+2. REAP-15和Ours的共同Top-12没有被改写，故$D_{\mathrm{drift}}$应小于$10^{-6}$；不满足时优先检查checkpoint是否物理共享/覆盖了权重、expert ID映射和缓存hidden states。
+3. Panel (a)只有在retention降低时$D_{\mathrm{drop}}$总体上升，才能支持“极端剪枝加剧功能丢失”；不要求每个相邻点严格单调。
+4. Panel (b)只有在$m$增大时$D_{\mathrm{drift}}$总体上升，才能支持“in-place merging扰动显著expert”。该图证明functional drift，不使用`expert collapse`一词；若要声称collapse，必须另补effective-rank或representation-diversity证据。
+5. Panel (c)若Ours比REAP具有更低$D_{\mathrm{comp}}$、比REAM具有更低$D_{\mathrm{drift}}$，且GSM8K accuracy最高，则支持“两类失败机制需要同时处理”。该结果是机制证据与性能相关性，不表述为严格因果证明。
+6. 若Ours的$D_{\mathrm{comp}}$更低但accuracy未提高，应报告局部输出偏差不足以完全预测端到端推理性能，不得只展示有利的两个偏差指标。
+
+## 结果表（完成后回填）
+
+### Panel (a)
+
+| Retention | Experts/layer | $D_{\mathrm{drop}}$ | 95% CI | Removed router mass |
+|-----------|--------------:|--------------------:|-------:|--------------------:|
+| 100% | 60 | | | |
+| 50% | 30 | | | |
+| 33.3% | 20 | | | |
+| 25% | 15 | | | |
+| 13.3% | 8 | | | |
+
+### Panel (b)
+
+| Sources merged per salient expert $m$ | $D_{\mathrm{drift}}$ | 95% CI | Layer-expert pairs |
+|---------------------------------------:|---------------------:|-------:|-------------------:|
+| 0 | | | |
+| 1 | | | |
+| 2 | | | |
+| 3 | | | |
+| 4 | | | |
+| 6 | | | |
+
+### Panel (c)
+
+| Method | Retention | $D_{\mathrm{comp}}$ | $D_{\mathrm{drift}}$ | GSM8K flexible EM | GSM8K strict EM |
+|--------|----------:|--------------------:|---------------------:|-------------------:|-----------------:|
+| REAP-15 | 25% | | | | |
+| REAM-15 | 25% | | | | |
+| Ours `12U+3M` | 25% | | | | |
+
+## 必须保存的产物
+
+```text
+artifacts/fig1_failure/
+  data_manifest.json
+  teacher_cache_manifest.json
+  pruning_metrics.csv
+    # seed, retention, prompt_id, layer, numerator, denominator,
+    # routed_token_count, removed_router_mass
+  drift_metrics.csv
+    # seed, method, merge_size, layer, expert_id, mapped_expert_id,
+    # n_tokens, numerator, denominator
+  method_summary.csv
+    # seed, method, retention, d_comp, d_drift,
+    # gsm8k_flexible, gsm8k_strict
+  gsm8k_outputs/
+  figure1_failure.pdf
+  figure1_failure.png
+```
+
+**产出：** 三个无训练25% retention checkpoints及manifest、五个纯剪枝retention点、六个受控merge-load点、完整GSM8K输出、两个偏差指标的raw numerator/denominator、bootstrap置信区间和最终三panel Figure 1。
+
+**状态：** 已设计，未运行。优先执行`数据冻结 → Original自检 → Panel (a) → Panel (b) → 三个25%模型与Panel (c)`；本实验不被Exp #7 Stage B训练阻塞。
