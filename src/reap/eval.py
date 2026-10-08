@@ -357,7 +357,9 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             logger.info(f"Finished evaluating LiveCodeBench")
     except Exception as e:
         logger.error(f"An error occurred during livecodebench: {e}")
-        pass
+        if use_server and "process" in locals():
+            process.terminate()
+        raise
     try:
         if eval_args.run_wildbench:
             from helm.benchmark.run import helm_run, create_helm_run_args
@@ -423,7 +425,9 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             logger.info(f"Finished evaluating evalscope math benchmarks")
         except Exception as e:
             logger.error(f"An error occurred during math evaluation: {e}")
-            pass
+            if use_server and "process" in locals():
+                process.terminate()
+            raise
 
     if use_server:
         process.terminate()

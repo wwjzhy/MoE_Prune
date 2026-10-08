@@ -1456,3 +1456,1095 @@ artifacts/fig1_failure/
 **产出：** 三个无训练25% retention checkpoints及manifest、五个纯剪枝retention点、六个受控merge-load点、完整GSM8K输出、两个偏差指标的raw numerator/denominator、bootstrap置信区间和最终三panel Figure 1。
 
 **状态：** 已设计，未运行。优先执行`数据冻结 → Original自检 → Panel (a) → Panel (b) → 三个25%模型与Panel (c)`；本实验不被Exp #7 Stage B训练阻塞。
+
+---
+
+# Exp #11（2026-10-08）— Qwen3-30B上的大规模Stage 1验证
+
+> **目标：** 在更大规模、专家数更多的`Qwen3-30B-A3B-Instruct-2507`上验证SPRM的零训练压缩效果。本实验只运行Stage 1；不运行LoRA、KD、OPD或任何压缩后恢复训练。主比较统一使用67%和75%的**routed-expert压缩率**，不得写成整个模型参数量或checkpoint大小缩小67%/75%。
+
+## 研究问题
+
+1. SPRM在128-expert、30B总参数量的MoE上是否仍优于纯剪枝和纯融合方法？
+2. 该优势能否同时出现在通用理解、数学推理和代码生成任务上？
+3. 从67%提高到75% routed-expert压缩后，SPRM是否比基线具有更平缓的性能下降？
+
+## 固定模型与架构
+
+| 项目 | 设置 |
+|------|------|
+| Teacher | `Qwen/Qwen3-30B-A3B-Instruct-2507` |
+| 精度 | BF16 |
+| Transformer层数 | 48 |
+| Routed experts / layer | 128 |
+| Active experts / token | 8 |
+| Shared expert | 该checkpoint无独立shared-expert配置 |
+| 训练 | 无；所有checkpoint均为one-shot、training-free压缩 |
+
+启动前必须将模型revision、`config.json`、tokenizer revision和chat template保存到实验manifest。禁止不同方法使用不同teacher revision。
+
+## routed-expert压缩预算
+
+定义：
+
+```text
+ExpertCompression = 1 - K / 128
+```
+
+| ID | 目标压缩率 | 最终物理experts/layer $K$ | 删除/合并的expert槽位 | 实际压缩率 |
+|----|-----------:|---------------------------:|-------------------------:|-----------:|
+| C67 | 67% | 42 | 86 | 67.1875% |
+| C75 | 75% | 32 | 96 | 75.0000% |
+
+论文和结果文件同时记录`K`与实际压缩率。所有方法在同一个压缩率下必须具有完全相同的物理expert预算；不得将42与43个experts都标成同一个67%条件。
+
+SPRM第一轮沿用当前约80%物理槽位保护、20%物理槽位用于Super-Experts的分配：
+
+| ID | SPRM结构 | Residual grouping |
+|----|----------|-------------------|
+| C67 | `34U+8M` | 剩余94个experts均衡分为8组，每组11或12个 |
+| C75 | `26U+6M` | 剩余102个experts均衡分为6组，每组17个 |
+
+这里的`U`表示权重完全不变的protected experts，`M`表示独立Super-Experts。若后续Protect-ratio消融冻结了不同的全局比例，必须在查看Exp #11 test结果前统一修改两个预算；禁止根据Qwen3的GSM8K、MATH-500或代码测试结果单独调节`P:C`。
+
+## 比较方法与checkpoint矩阵
+
+| ID | 方法 | C67（K=42） | C75（K=32） | 说明 |
+|----|------|-------------|-------------|------|
+| E11-T | Teacher / 未剪枝 | 128 | 128 | 只生成和评测一次 |
+| E11-RP | REAP | Top-42 | Top-32 | 按相同calibration上的REAP saliency进行纯剪枝 |
+| E11-HC | HC-SMoE（记录中亦称HC-MoE） | 聚类为42 | 聚类为32 | 使用同一实现与固定聚类设置 |
+| E11-RM | REAM | 融合为42 | 融合为32 | in-place saliency-centroid merging |
+| E11-S | SPRM | `34U+8M` | `26U+6M` | saliency protection + residual merging + grouped router |
+
+总计生成8个压缩checkpoint，加1个Teacher参考。各方法必须从同一Teacher开始，不允许从另一个方法的压缩checkpoint继续处理。
+
+## Calibration与公平性约束
+
+主实验只生成一套任务无关的压缩checkpoint，并用它同时评测General、Math和Code，禁止针对三个benchmark track分别选择experts或调整分组。
+
+```yaml
+compression_calibration: C4
+num_calibration_sequences: 2048
+sequence_length: 2048
+seed: 42
+dtype: bfloat16
+training: false
+```
+
+若仓库中已经存在论文主实验冻结的任务无关C4 manifest，则优先复用；若不存在，按上述配置创建一次。必须保存dataset revision、原始样本ID、预处理版本、样本顺序和SHA256。所有方法与两个压缩率共享同一份calibration manifest、teacher activations、tokenizer和chat template。
+
+REAP saliency只计算一次并同时供REAP、REAM和SPRM使用。HC-SMoE可使用自身论文定义的聚类信号，但不得获得更多calibration sequences或tokens。禁止使用GSM8K/MATH-500 test、HumanEval+或MBPP+题目进行expert selection、分组、超参数选择或停止判断。
+
+SPRM必须保留完整`group_manifest.json`与grouped log-sum-exp router；不得为了适配推理后端把它替换成普通42-row或32-row centroid router。当前grouped router未被vLLM原生支持时，五种方法统一使用HF Transformers后端评测。
+
+## Benchmark与评测口径
+
+| Track | Benchmark | 汇总指标 |
+|-------|-----------|----------|
+| General | ARC-Challenge、ARC-Easy、BoolQ、HellaSwag、MMLU、OpenBookQA、RTE、WinoGrande | MC8 Avg |
+| Code | MBPP+、HumanEval+ | Code Avg |
+| Math | GSM8K、MATH-500 | Math Avg |
+
+`HumanEval+`使用与Exp #7--#9一致的EvalPlus test与pass@1口径；数据revision、EvalPlus执行器版本、超时和沙箱限制必须在首次运行前冻结。禁止混入标准HumanEval结果。
+
+所有条件共享相同prompt template、few-shot设置、generation参数、答案抽取器、代码执行器和grader。生成任务第一轮统一使用greedy decoding：
+
+```yaml
+do_sample: false
+temperature: 0
+max_input_length: 2048
+max_new_tokens: 1024
+```
+
+若某个benchmark的官方协议要求不同长度或特殊stop tokens，以官方协议为准，但必须对所有方法一致并在manifest中记录。主文分别报告MC8 Avg、Code Avg和Math Avg，不把八个MC任务与四个生成任务直接按题目数pool成一个总分；如需单一摘要指标，只能额外报告三个domain average的macro average。
+
+## 指标
+
+每个方法、压缩率和任务保存原始分数，并计算：
+
+```text
+Delta_Teacher(method, domain)
+  = Score(method, domain) - Score(Teacher, domain)
+
+Delta_Best(method=SPRM, domain)
+  = Score(SPRM, domain)
+    - max(Score(REAP), Score(HC-SMoE), Score(REAM))
+
+CompressionDrop_67_to_75(method, domain)
+  = Score_C75(method, domain) - Score_C67(method, domain)
+```
+
+同时记录：
+
+1. 每层最终物理expert数、唯一expert权重数与active experts/token；
+2. checkpoint磁盘大小、加载后峰值GPU显存；
+3. saliency/scoring、grouping、alignment、fusion各阶段wall time及总GPU hours；
+4. 每个benchmark的空输出、乱码、重复循环、超时和代码执行失败数；
+5. SPRM每层protected expert IDs、残差分组、对齐参考expert、融合权重和source-to-physical router映射。
+
+## 机器占用与一卡一配置并行调度
+
+Exp #11独占一台`8×H20`机器。共享Teacher统计完成后，8个压缩配置必须一一绑定到8张GPU并行运行；禁止让单个配置默认占用整机，也禁止在同一张GPU上同时驻留两个模型进程。
+
+| GPU | 实验配置 | 物理experts/layer | SPRM结构（如适用） |
+|----:|----------|-------------------:|----------------------|
+| 0 | E11-RP-C67 | 42 | — |
+| 1 | E11-HC-C67 | 42 | — |
+| 2 | E11-RM-C67 | 42 | — |
+| 3 | E11-S-C67 | 42 | `34U+8M` |
+| 4 | E11-RP-C75 | 32 | — |
+| 5 | E11-HC-C75 | 32 | — |
+| 6 | E11-RM-C75 | 32 | — |
+| 7 | E11-S-C75 | 32 | `26U+6M` |
+
+每个worker必须显式设置单卡可见性并保持单进程：
+
+```text
+CUDA_VISIBLE_DEVICES=<gpu_id>
+WORLD_SIZE=1
+LOCAL_RANK=0
+```
+
+不得继承会自动启动8卡`torchrun`、Ray或vLLM tensor-parallel worker的环境变量。每个配置使用独立的`output_dir`、`tmp_dir`、日志文件和随机数状态；Teacher checkpoint、tokenizer、calibration manifest与只读teacher statistics可以共享。启动前先把Teacher完整下载到机器本地缓存，禁止8个worker同时从远端下载或写同一cache文件。
+
+### 共享预计算
+
+以下内容只计算一次，然后由8个worker只读复用：
+
+1. 冻结后的C4 calibration样本与tokenized inputs；
+2. REAP saliency与每层expert排序；
+3. 可共享的router profiles、expert activation statistics和teacher output statistics；
+4. tokenizer、chat template、benchmark manifests及其SHA256。
+
+共享统计必须带Teacher revision、数据hash、层号、dtype和shape manifest。任一worker发现hash不一致时立即停止，禁止自行重新计算一份不同的calibration统计。HC-SMoE需要的独有聚类统计、REAM需要的matching/fusion统计和SPRM需要的grouping/alignment统计由各自worker在单卡上继续计算。
+
+### 单卡显存预检
+
+正式并发前，先在一张空闲H20上对预计峰值最高的`E11-S-C75`执行：
+
+```text
+完整Teacher加载 → 一个MoE层的grouping/alignment/fusion → 20条prompt前向
+```
+
+记录峰值HBM和host RAM。只有完整模型与压缩工作区能够稳定驻留单张卡、且峰值HBM不超过该卡容量的90%，才启动8路并行。压缩实现必须逐层处理并及时释放临时对齐矩阵与source-expert副本，不能在GPU上同时保留全模型的第二份权重。
+
+若单卡预检OOM，不允许直接让8个worker各自反复重试；此时“一卡一配置”在当前实现下不可行，应改为`2 GPUs/config`的tensor-parallel方案并分两轮运行。该降级必须记录在资源表中，不能把多卡配置的GPU hours与单卡配置直接比较。
+
+## 运行顺序
+
+1. Exp #11申请并独占一台8×H20机器，冻结Teacher revision、tokenizer、chat template、C4 calibration manifest与全部benchmark revision。
+2. 预下载Teacher到本地只读缓存；运行E11-T的20条固定prompt smoke并完成Teacher的MC8、Math、Code参考评测。若已有完全相同revision和评测hash的结果可以直接复用，否则不得跳过。
+3. 完成一次共享teacher-statistics预计算，保存FP32统计量、shape manifest与hash；不得让8个压缩worker重复执行该步骤。
+4. 对`E11-S-C75`完成单卡显存预检。通过后，按上表同时启动8个独立worker；模型加载阶段可短暂错峰以避免本地磁盘和host RAM瞬时拥塞，但加载完成后8张卡应同时计算。
+5. 每个worker依次完成`压缩 → 结构检查 → 20条固定prompt smoke → MC8 → MBPP+ → HumanEval+ → GSM8K → MATH-500`，并持续写入自身状态文件。一个worker失败不得终止其他七个有效worker。
+6. 每个worker必须检查最终物理expert数、router shape、Top-8物理expert无重复、前向finite values与checkpoint hash。SPRM额外检查grouped-router映射覆盖全部128个source experts且每个source只映射一次。
+7. 8个worker全部完成后汇总逐任务结果、domain averages、`Delta_Best`、C67到C75的性能下降和资源统计；不得在未齐全时用先完成的方法组成临时主表。
+8. 第一轮只运行compression seed 42。若SPRM在至少两个domain上优于最强基线，再单独申请下一台机器或下一轮8卡时段，对SPRM及对应最强基线补calibration seed 43、44并报告mean ± std；不要占用第一轮的8个主配置槽位。
+
+## 结果表（完成后回填）
+
+### C67：67.1875% routed-expert压缩
+
+| Method | Experts/layer | MC8 Avg | MBPP+ | HumanEval+ | Code Avg | GSM8K | MATH-500 | Math Avg |
+|--------|--------------:|--------:|------:|----------:|---------:|------:|---------:|---------:|
+| Teacher | 128 | | | | | | | |
+| REAP | 42 | | | | | | | |
+| HC-SMoE | 42 | | | | | | | |
+| REAM | 42 | | | | | | | |
+| SPRM `34U+8M` | 42 | | | | | | | |
+| SPRM $-$ best baseline | 0 | | | | | | | |
+
+### C75：75% routed-expert压缩
+
+| Method | Experts/layer | MC8 Avg | MBPP+ | HumanEval+ | Code Avg | GSM8K | MATH-500 | Math Avg |
+|--------|--------------:|--------:|------:|----------:|---------:|------:|---------:|---------:|
+| Teacher | 128 | | | | | | | |
+| REAP | 32 | | | | | | | |
+| HC-SMoE | 32 | | | | | | | |
+| REAM | 32 | | | | | | | |
+| SPRM `26U+6M` | 32 | | | | | | | |
+| SPRM $-$ best baseline | 0 | | | | | | | |
+
+### 资源统计
+
+| Method | Compression | Checkpoint GB | Load peak VRAM GB | Compression GPU hours | Eval GPU hours |
+|--------|------------:|--------------:|------------------:|----------------------:|---------------:|
+| Teacher | 0% | | | 0 | |
+| REAP | 67% | | | | |
+| HC-SMoE | 67% | | | | |
+| REAM | 67% | | | | |
+| SPRM | 67% | | | | |
+| REAP | 75% | | | | |
+| HC-SMoE | 75% | | | | |
+| REAM | 75% | | | | |
+| SPRM | 75% | | | | |
+
+## 判定与结论边界
+
+1. SPRM在C67与C75的MC8、Code、Math三个domain averages中均高于同预算最佳基线：可以声称方法在更大规模Qwen3-MoE上跨领域、跨两个极端压缩率泛化。
+2. SPRM只在C75明显领先、C67与最强基线接近：可以声称保护与残差融合的优势主要出现在更激进的压缩区间。
+3. SPRM只在Math或Code领先：结论必须限定到对应domain，并检查任务无关C4 calibration下的expert覆盖，不得写成通用提升。
+4. SPRM低于REAM但高于REAP：只能证明融合残差信息优于纯剪枝，不能证明saliency protection优于纯融合；需要结合组件消融解释。
+5. E11-S出现NaN、重复物理expert选择、乱码或明显高于其他方法的生成失败率：先检查grouped-router聚合、Top-8去重、权重对齐和tensor保存；修复前不得计入方法结果。
+6. 不将单次seed 42结果描述为统计显著或稳定；只有补齐预先规定的seed后才报告mean ± std。
+
+## 必须保存的产物
+
+```text
+artifacts/exp11_qwen3_30b/
+  data_manifest.json
+  teacher_manifest.json
+  calibration_manifest.json
+  reap_saliency/
+  c67/
+    reap/
+    hc_smoe/
+    ream/
+    sprm/
+  c75/
+    reap/
+    hc_smoe/
+    ream/
+    sprm/
+  eval_outputs/
+  benchmark_scores.json
+  domain_summary.csv
+  resource_summary.csv
+```
+
+每个压缩目录必须包含模型config、source revision、compression config、最终expert计数、checkpoint hash与方法特有manifest。SPRM额外保存完整group/router manifest；REAM保存centroid/source映射；HC-SMoE保存聚类树或最终cluster assignment；REAP保存每层保留expert列表。
+
+**产出：** 8个Qwen3-30B BF16零训练压缩checkpoint、1份Teacher结果、C67/C75的MC8/Math/Code完整评测、逐任务原始输出、domain summary、expert与router manifests、checkpoint大小、峰值显存和GPU-hour统计。
+
+**状态：** 已设计，未运行。执行优先级为`数据与Teacher冻结 → Teacher评测 → C67四方法 → C75四方法 → 结果汇总 → 必要时补seed`；本实验不依赖任何Stage 2训练产物。
+
+---
+
+# Exp #12（2026-10-08）— Protect比例与SPRM组件消融
+
+> **目标：** 在`Qwen1.5-MoE-A2.7B-Chat`的75% routed-expert压缩下，分别回答两个问题：（A）固定15个物理expert槽位时，多少槽位用于保护原始expert最合适；（B）saliency protection、functional grouping、neuron alignment、saliency-weighted fusion和group-preserving router是否分别必要。本实验只有Stage 1，不训练、不运行LoRA/KD/OPD；全部配置在同一台8卡机器上完成。
+
+## 固定模型、数据与评测
+
+| 项目 | 设置 |
+|------|------|
+| Teacher | `Qwen1.5-MoE-A2.7B-Chat`，冻结revision |
+| MoE结构 | 24层；每层60个routed experts；Top-4 routing |
+| Expert压缩率 | 75% |
+| 最终物理expert预算 | 每层`K=15` |
+| Calibration | 与Exp #6一致：NuminaMath 1,536 + The-Stack-Smol 1,536 |
+| Calibration长度 | 3,072 sequences × 512 tokens |
+| Calibration seed | 42 |
+| 评测 | MC8：ARC-Challenge、ARC-Easy、BoolQ、HellaSwag、MMLU、OpenBookQA、RTE、WinoGrande |
+| 训练 | 无；全部为one-shot、training-free压缩 |
+
+所有配置必须使用同一份Teacher checkpoint、tokenizer、chat template、calibration manifest、REAP saliency、teacher activation statistics、MC8 evaluator和prompt配置。若Exp #6的manifest与上述配置完全一致，必须复用其Teacher统计、E6-S checkpoint和Teacher MC8结果；hash不一致时不得混用。
+
+## Part A：Protect槽位比例消融
+
+### 定义
+
+本实验中的“保护率”不是原始expert保留率，而是压缩后15个物理槽位中用于protected experts的比例：
+
+```text
+ProtectSlotRatio = P / K,  K = 15
+P = protected experts
+C = residual super-experts
+P + C = 15
+```
+
+所有配置均执行同一套SPRM流程：选择Top-$P$ saliency experts保持原权重，将剩余`60-P`个source experts均衡分成$C$组，经过functional grouping、neuron alignment和saliency-weighted fusion生成$C$个Super-Experts，并使用grouped log-sum-exp router。`P0`没有protected experts，其余步骤不变。
+
+| ID | ProtectSlotRatio | $P$ | $C$ | 最终结构 | Residual group size |
+|----|-----------------:|----:|----:|----------|--------------------:|
+| E12-P0 | 0% | 0 | 15 | `0U+15M` | 60个sources分15组，每组4个 |
+| E12-P20 | 20% | 3 | 12 | `3U+12M` | 57个sources分12组，每组4或5个 |
+| E12-P40 | 40% | 6 | 9 | `6U+9M` | 54个sources分9组，每组6个 |
+| E12-P60 | 60% | 9 | 6 | `9U+6M` | 51个sources分6组，每组8或9个 |
+| E12-P80 | 80% | 12 | 3 | `12U+3M` | 48个sources分3组，每组16个 |
+
+`P0`是无protected expert的all-merge SPRM端点。本实验不运行100% Protect端点；纯剪枝证据来自主实验中相同Teacher、预算和评测hash下的REAP-15结果，hash不一致时只注明不可直接比较，不在Exp #12补跑。
+
+`E12-P80`与Exp #6 Stage 1的Full SPRM `12U+3M`完全相同；checkpoint、calibration和实现hash一致时只评测/引用一次，禁止重复压缩。该曲线用于分析方法对$P:C$分配的敏感性，不允许根据MC8 test结果回头调整已经报告的主实验配置。
+
+## Part B：组件消融
+
+所有组件消融固定为75% expert压缩、`P=12`、`C=3`、每组16个source experts。除表中指定组件外，其余设置必须与Full SPRM逐项一致。
+
+| ID | Variant | 唯一变化 | 其余组件 |
+|----|---------|----------|----------|
+| E12-Full | Full SPRM | 无；直接复用`E12-P80` | 完整方法 |
+| E12-RP | Random Protect | 每层从60个experts中均匀无放回随机选择12个protected experts | functional balanced grouping + alignment + saliency fusion + grouped router |
+| E12-RG | Random Group | 固定Top-12 protected，将剩余48个experts随机均衡分成3组×16 | alignment + saliency fusion + grouped router |
+| E12-NA | No Alignment | 组内不执行Hungarian permutation，使用identity neuron order | saliency protection + functional grouping + saliency fusion + grouped router |
+| E12-UF | Uniform Fusion | 对齐后使用`alpha_j=1/16`，替代组内saliency归一化权重 | saliency protection + functional grouping + alignment + grouped router |
+| E12-CR | Centroid Router | protected rows不变；每个Super-Expert只保留其alignment reference/centroid对应router row，不做group log-sum-exp | saliency protection + functional grouping + alignment + saliency fusion |
+
+全部组件消融只运行compression seed 42。`Random Protect`和`Random Group`必须保存实际随机选择结果，但本实验不据此声称跨seed稳定性或统计显著性。任何消融不得改变calibration样本、最终物理expert数、Top-4 active physical experts、融合dtype或评测后端。
+
+## 指标与结果表
+
+主指标为MC8 Avg，同时报告八个任务的完整分数。每个配置计算：
+
+```text
+Delta_Full(task) = Score_variant(task) - Score_Full(task)
+Delta_Full_MC8   = MC8Avg_variant - MC8Avg_Full
+```
+
+额外保存但不作为主表排序依据：layer-output distortion、每层physical routing load、空输出/乱码数量、checkpoint大小、压缩wall time和峰值显存。
+
+### Protect槽位比例
+
+| Protect slots | Structure | ARC-C | ARC-E | BoolQ | HellaSwag | MMLU | OBQA | RTE | WinoGrande | MC8 Avg |
+|--------------:|-----------|------:|------:|------:|----------:|-----:|-----:|----:|----------:|--------:|
+| 0% | `0U+15M` | | | | | | | | | |
+| 20% | `3U+12M` | | | | | | | | | |
+| 40% | `6U+9M` | | | | | | | | | |
+| 60% | `9U+6M` | | | | | | | | | |
+| 80% | `12U+3M` | | | | | | | | | |
+
+### 组件消融
+
+| Variant | Seed | MC8 Avg | $\Delta$ Full | Output distortion | Failure count |
+|---------|-----:|---------:|--------------:|------------------:|--------------:|
+| Full SPRM | 42 | | 0 | | |
+| Random Protect | 42 | | | | |
+| Random Group | 42 | | | | |
+| No Alignment | 42 | | | | |
+| Uniform Fusion | 42 | | | | |
+| Centroid Router | 42 | | | | |
+
+## 单机8卡并行调度
+
+Exp #12独占一台8-GPU机器。Qwen1.5与每个压缩配置均使用单卡、单进程；共享Teacher与calibration统计只读复用。共有11个逻辑行，但`E12-Full`与`E12-P80`是同一配置，因此只有10个唯一checkpoint，需要两轮完成。
+
+### Wave 1：五个比例点 + 三个组件消融
+
+| GPU | 配置 |
+|----:|------|
+| 0 | E12-P0 |
+| 1 | E12-P20 |
+| 2 | E12-P40 |
+| 3 | E12-P60 |
+| 4 | E12-P80 / E12-Full（只生成一次） |
+| 5 | E12-RP，seed 42 |
+| 6 | E12-RG，seed 42 |
+| 7 | E12-NA，seed 42 |
+
+### Wave 2：剩余两个组件
+
+| GPU | 配置 |
+|----:|------|
+| 0 | E12-UF，seed 42 |
+| 1 | E12-CR，seed 42 |
+| 2 | Teacher MC8复测（仅当不能安全复用时） |
+| 3--7 | 失败配置重试或空闲；不得启动未批准的新消融 |
+
+每个worker设置独立的`CUDA_VISIBLE_DEVICES`、`output_dir`、`tmp_dir`和日志文件，保持`WORLD_SIZE=1`。不得由`torchrun`、Ray或vLLM自动占用整机。两个wave之间只等待Wave 1的压缩checkpoint安全落盘；Wave 1单个非关键worker失败不阻塞其他完成项，失败配置转入Wave 2的GPU 7或单独补跑。
+
+Teacher结果只有在模型revision、MC8 evaluator、prompt、few-shot、dtype与Exp #6结果hash全部一致时才能复用；否则在Wave 2的GPU 2上重测。所有worker必须检查：
+
+```text
+physical_expert_count == 15
+active_physical_experts_per_token == 4
+protected与merge groups互不重叠
+protected与merge groups覆盖全部60个source experts
+每个source expert只映射到一个physical expert
+forward logits和expert weights均为finite
+```
+
+## 运行顺序
+
+1. 独占一台8卡机器，冻结Teacher、calibration与MC8 evaluator manifests，完成hash检查。
+2. 计算或复用一次saliency、router profiles、expert activations和teacher statistics；禁止每个worker重复做Teacher前向。
+3. 在单卡上完成`E12-P80/E12-Full`的20条prompt smoke与manifest自检；若复用Exp #6 checkpoint，则直接验证其hash和输出。
+4. 按Wave 1映射同时启动8个worker，依次执行`压缩 → 结构断言 → 20条MC smoke → 完整MC8`。
+5. Wave 1产物落盘后按Wave 2映射运行；Random Protect与Random Group只运行seed 42，不追加其它seed。
+6. 汇总Protect比例曲线、组件消融表、逐任务结果、output distortion、失败样本与资源统计。
+
+## 判定与结论边界
+
+1. `P80`高于`P0`：支持在all-merge方案中加入saliency protection有效，但不能仅凭Exp #12声称优于纯剪枝；纯剪枝比较引用主实验的REAP-15。
+2. MC8随ProtectSlotRatio从0%到80%提高后出现饱和或非单调变化：说明保护与残差覆盖之间存在trade-off；如果持续单调上升，只能报告在已测范围内更多保护更好，不能推断100%端点。
+3. `Random Protect < Full`：支持saliency protection；`Random Group < Full`：支持functional grouping。
+4. `No Alignment < Full`、`Uniform Fusion < Full`、`Centroid Router < Full`分别支持alignment、saliency weighting和grouped routing。如果某个消融与Full持平或更好，应简化方法或将该组件降为实现选择，不能声称其带来性能提升。
+5. Random Protect与Random Group只有seed 42，因此只能作为受控组件对照，不能声称结果具有跨seed稳定性或统计显著性。
+6. 本实验只验证Qwen1.5、75%压缩和MC8，不声称组件重要性已经跨模型、跨压缩率或跨Math/Code泛化。
+
+## 必须保存的产物
+
+```text
+artifacts/exp12_ablation/
+  data_manifest.json
+  teacher_statistics_manifest.json
+  protect_ratio/
+    p0/
+    p20/
+    p40/
+    p60/
+    p80_full/
+  components/
+    random_protect/seed_42/
+    random_group/seed_42/
+    no_alignment/
+    uniform_fusion/
+    centroid_router/
+  mc8_outputs/
+  protect_ratio_summary.csv
+  component_ablation_summary.csv
+  resource_summary.csv
+```
+
+每个目录保存compression config、checkpoint hash、protected IDs、group assignments、alignment references、fusion weights、router mapping、逐任务原始输出、分数与资源日志。`p80_full`只允许存在一份canonical checkpoint，组件表与比例表通过同一hash引用。
+
+**产出：** 五点Protect-slot曲线、Full SPRM与五项组件消融、完整MC8逐任务结果、output distortion、失败样本和资源统计。
+
+**状态：** 已设计，未运行。执行顺序为`共享统计 → Full smoke → Wave 1 → Wave 2 → 汇总`；全部实验在同一台8卡机器上完成，不依赖Exp #11或任何Stage 2训练结果。
+
+---
+
+# Exp #13（2026-10-08）— FP8/W4A16量化模型上的75% Expert压缩兼容性
+
+> **目标：** 直接从两个已量化的`Qwen3-30B-A3B-Instruct-2507` checkpoint出发，在75% routed-expert压缩下比较Original Quantized、REAP、REAM和SPRM，验证SPRM在FP8与W4A16部署格式中是否仍保留相对优势。本实验只做Stage 1，不训练、不运行LoRA/KD/OPD；8个主配置在同一台8卡机器上一卡一配置并行完成。
+
+## 与Exp #9和Exp #11的区别
+
+```text
+Exp #9：BF16 expert压缩 → post-training W4A16量化
+Exp #11：BF16 Qwen3主实验
+Exp #13：从官方/公开量化checkpoint出发 → 在量化模型上执行expert压缩
+```
+
+Exp #13验证的是`Quantized checkpoint → Expert compression`兼容性，不复用Exp #9的`Compression → Quantization`结论。Exp #11只提供BF16参考；不得把Exp #11与Exp #13中不同管线产生的checkpoint当作同一模型。
+
+## 固定模型与精度
+
+| Precision track | Source checkpoint | 量化格式 |
+|-----------------|------------------|----------|
+| FP8 | `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` | E4M3、128×128 block-wise weight quantization、dynamic activation scheme |
+| W4A16 | `RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16` | INT4 weights、BF16 activations、checkpoint自带compressed-tensors配置 |
+
+两个checkpoint均对应48层、每层128个routed experts、Top-8 routing的Qwen3-MoE。启动前冻结各自的model revision、`config.json`、quantization config、tokenizer revision、chat template和checkpoint hash。禁止依据名称假设量化参数；实际重打包与重新量化必须读取并复用源checkpoint中的量化元数据。
+
+## 固定压缩预算
+
+只运行75% routed-expert压缩：
+
+```text
+N = 128
+K = 32
+ExpertCompression = 1 - 32 / 128 = 75%
+TopK_active = 8
+```
+
+| Method | 最终结构 |
+|--------|----------|
+| Original Quantized | 128个量化experts，不压缩 |
+| REAP | Top-32原始量化experts，删除其余96个 |
+| REAM | 32个in-place merged experts |
+| SPRM | `26U+6M`：26个bit-identical protected experts + 6个量化Super-Experts；剩余102个source experts均衡分为6组×17 |
+
+所有压缩方法最终均存储32个物理experts/layer并保持Top-8 active physical experts/token。Router、embedding、normalization、attention和`lm_head`除方法定义所需的router映射外不得改变。
+
+## 两类压缩管线
+
+### REAP：直接量化剪枝
+
+```text
+Quantized checkpoint
+  → 在量化模型上计算REAP saliency
+  → 保留Top-32 expert的量化权重与scales
+  → 删除其余96个experts及对应router rows
+  → 不重新量化
+```
+
+REAP checkpoint中的保留expert tensor、scale和zero-point（如格式存在）必须与Original Quantized逐bit一致。
+
+### REAM/SPRM：反量化、融合、按原格式重新量化
+
+量化整数/FP8编码和原有scales不能直接做神经元排列与权重平均。REAM和SPRM统一使用：
+
+```text
+Quantized source expert weights
+  → 仅将参与融合的expert projection反量化到BF16
+  → BF16 neuron alignment与weight fusion
+  → 按当前precision track的原始格式重新量化merged experts
+  → 保存新的量化tensor与scales
+```
+
+具体约束：
+
+1. FP8重新量化必须复用E4M3与128×128 weight block size，activation scheme保持dynamic；
+2. W4A16重新量化必须复用源checkpoint的compressed-tensors scheme、group size、对称性、module coverage及scale/zero-point dtype；
+3. REAM的32个centroid在吸收source experts后全部视为已修改，必须重新量化；
+4. SPRM的26个protected experts必须连同量化tensor与scales逐bit复制，只有6个Super-Experts重新量化；
+5. 非expert量化模块直接从Original Quantized复制，不得为REAM/SPRM重新量化整个模型；
+6. 禁止直接平均INT4 codes、FP8 codes或量化scales来代替BF16 fusion。
+
+本实验不增加ReQuant-Teacher主配置，以保持8卡矩阵。为区分融合损失和重新量化误差，REAM/SPRM worker必须在每层保存merged BF16权重重新量化前后的normalized weight MSE、max error、scale range，并对20条固定prompts保存重新量化前后next-token logits差异。若最终结果异常，再追加完整mixed-precision pre-requant evaluation；该诊断不属于第一轮主实验。
+
+## Calibration与共享统计
+
+两个precision track使用相同的任务无关数据样本，但分别在各自Original Quantized模型上计算saliency和teacher statistics：
+
+```yaml
+compression_calibration: C4
+num_calibration_sequences: 2048
+sequence_length: 2048
+seed: 42
+training: false
+```
+
+必须复用Exp #11冻结的C4样本ID、顺序、tokenized inputs和SHA256；如Exp #11尚未冻结，则在Exp #13创建一次并供两种精度共享。FP8和W4A16分别产生一份REAP saliency、router profiles和expert activation statistics，三种压缩方法在同一precision track内只读复用，禁止每个worker独立抽样。
+
+W4A16 merged experts如果需要activation-aware重新量化，使用Exp #9冻结的128条C4量化校准子集与相同顺序；若不存在则从上述2048条compression calibration中固定前128条，单独保存`quant_calibration_manifest.json`。FP8 block-wise weight重新量化不额外使用任务测试数据。
+
+任何GSM8K/MATH-500/HumanEval+/MBPP+/MC8 test样本都不得参与saliency、grouping、alignment、fusion、quantization calibration或超参数选择。
+
+## Benchmark与评测口径
+
+| Track | Benchmark | 汇总指标 |
+|-------|-----------|----------|
+| General | ARC-Challenge、ARC-Easy、BoolQ、HellaSwag、MMLU、OpenBookQA、RTE、WinoGrande | MC8 Avg |
+| Code | MBPP+、HumanEval+ | Code Avg |
+| Math | GSM8K、MATH-500 | Math Avg |
+
+沿用Exp #11冻结的数据revision、prompt、few-shot、答案抽取器、EvalPlus版本、代码沙箱、超时和generation config。所有方法在同一precision track必须使用同一后端；由于SPRM需要grouped log-sum-exp router，只有在一个后端同时正确支持Original、REAP、REAM和SPRM时才能形成主表，禁止Original/基线使用vLLM而SPRM单独使用HF后直接比较吞吐或分数。
+
+第一轮生成统一为：
+
+```yaml
+do_sample: false
+temperature: 0
+max_input_length: 2048
+max_new_tokens: 1024
+```
+
+如果某benchmark的冻结官方协议另有要求，对四种方法一致应用并写入manifest。主文分别报告MC8 Avg、Code Avg、Math Avg，不把任务样本直接pool成一个总分。
+
+## 实验矩阵与单机8卡分配
+
+Exp #13独占一台8-GPU机器；每个配置单卡、单进程运行。两种precision各4个配置，恰好占满8张GPU：
+
+| GPU | ID | Precision | Method | Experts/layer |
+|----:|----|-----------|--------|--------------:|
+| 0 | E13-FP8-T | FP8 | Original Quantized | 128 |
+| 1 | E13-FP8-RP | FP8 | REAP | 32 |
+| 2 | E13-FP8-RM | FP8 | REAM | 32 |
+| 3 | E13-FP8-S | FP8 | SPRM `26U+6M` | 32 |
+| 4 | E13-W4-T | W4A16 | Original Quantized | 128 |
+| 5 | E13-W4-RP | W4A16 | REAP | 32 |
+| 6 | E13-W4-RM | W4A16 | REAM | 32 |
+| 7 | E13-W4-S | W4A16 | SPRM `26U+6M` | 32 |
+
+每个worker显式设置独立`CUDA_VISIBLE_DEVICES`、`output_dir`、`tmp_dir`、日志文件和端口，保持`WORLD_SIZE=1`。不得继承会自动占用整机的`torchrun`、Ray或tensor-parallel环境。两个source checkpoint必须在启动前完整下载到本地只读cache；禁止8个worker同时远程下载或写同一量化cache。
+
+正式并发前分别对`E13-FP8-S`和`E13-W4-S`做单层`dequantize → align → fuse → requantize → reload`round-trip，自检通过后再启动整机。若单卡无法容纳Original Quantized与当前层融合workspace，先改为逐层CPU/BF16 staging并及时释放临时tensor；仍OOM时停止一卡一配置方案，不允许静默CPU offload后仍声称相同GPU效率。
+
+## 必须断言
+
+每个checkpoint保存前必须检查：
+
+```text
+compressed physical_expert_count == 32
+active_physical_experts_per_token == 8
+all quantized tensors/scales/zero-points are finite
+quantized module coverage matches the source precision track
+REAP retained expert quantized payloads are bit-identical to Original
+SPRM 26 protected expert payloads are bit-identical to Original
+SPRM groups cover exactly the other 102 source experts, 6 groups × 17
+every source expert maps to exactly one SPRM physical expert
+grouped Top-8 never selects the same physical expert twice
+saved checkpoint reloads without silently dequantizing all experts to BF16
+```
+
+另外统计每层实际量化expert projections数量、scale tensor数量、量化后dtype分布与checkpoint字节数。任何方法静默跳过expert量化时，该run无效。
+
+## 指标
+
+除逐任务原始分数外，计算：
+
+```text
+CompressionDrop(method, task, precision)
+  = Score(method, task, precision)
+    - Score(OriginalQuantized, task, precision)
+
+DeltaBestQ(task, precision)
+  = Score(SPRM, task, precision)
+    - max(Score(REAP, task, precision), Score(REAM, task, precision))
+```
+
+同时报告：
+
+1. MC8 Avg、Code Avg、Math Avg；
+2. checkpoint GB、加载后peak VRAM、压缩wall time与GPU hours；
+3. REAM/SPRM merged weights重新量化前后的weight MSE与20-prompt logit error；
+4. 空输出、乱码、重复循环、超时和代码执行失败数；
+5. 实际量化模块覆盖、scales/zero-points数量和dtype分布。
+
+## 结果表（完成后回填）
+
+### FP8
+
+| Method | Experts/layer | MC8 Avg | MBPP+ | HumanEval+ | Code Avg | GSM8K | MATH-500 | Math Avg | Checkpoint GB |
+|--------|--------------:|--------:|------:|-----------:|---------:|------:|---------:|---------:|--------------:|
+| Original FP8 | 128 | | | | | | | | |
+| REAP FP8 | 32 | | | | | | | | |
+| REAM FP8 | 32 | | | | | | | | |
+| SPRM FP8 `26U+6M` | 32 | | | | | | | | |
+| SPRM $-$ best baseline | 0 | | | | | | | | — |
+
+### W4A16
+
+| Method | Experts/layer | MC8 Avg | MBPP+ | HumanEval+ | Code Avg | GSM8K | MATH-500 | Math Avg | Checkpoint GB |
+|--------|--------------:|--------:|------:|-----------:|---------:|------:|---------:|---------:|--------------:|
+| Original W4A16 | 128 | | | | | | | | |
+| REAP W4A16 | 32 | | | | | | | | |
+| REAM W4A16 | 32 | | | | | | | | |
+| SPRM W4A16 `26U+6M` | 32 | | | | | | | | |
+| SPRM $-$ best baseline | 0 | | | | | | | | — |
+
+## 运行顺序
+
+1. 独占一台8卡机器，冻结两个source revisions、量化配置、C4 manifests和benchmark manifests，并将两个source checkpoint预下载到本地。
+2. 分别在FP8和W4A16 Original上计算一次REAP saliency与共享teacher statistics，保存precision-specific hash；禁止跨precision混用saliency。
+3. 对FP8-SPRM和W4A16-SPRM完成单层round-trip、checkpoint reload、量化module coverage和20条prompt smoke；任一失败时先修复对应precision管线。
+4. 自检通过后按GPU表同时启动8个worker。Original worker直接评测；REAP worker执行直接量化剪枝后评测；REAM/SPRM worker完成逐层融合、重新量化、reload后评测。
+5. 每个worker依次运行`MC8 → MBPP+ → HumanEval+ → GSM8K → MATH-500`，持续保存断点状态；单个worker失败不得终止其他有效worker。
+6. 八个配置齐全后生成FP8/W4A16两张主表、逐任务`CompressionDrop`、`DeltaBestQ`及资源/量化误差表。
+
+## 判定与结论边界
+
+1. SPRM在FP8与W4A16的三个domain averages均高于同precision的REAP和REAM：支持SPRM兼容两种量化格式，并在75% expert压缩下保持相对优势。
+2. SPRM只在FP8领先、W4A16不领先：只能声称FP8兼容；优先检查W4 super-expert重新量化误差和异常scale，不能泛化到4-bit。
+3. REAM/SPRM的pre/post-requant误差很大且二者同步下降：应将问题归因于merge后的重新量化瓶颈，而不是直接归因于保护—融合结构。
+4. REAP明显领先合并方法：说明直接删除量化tensor在该格式更稳定；必须如实报告，不为单个方法调节量化参数。
+5. Original Quantized本身在统一评测下异常低或出现大量生成失败：先修复加载、chat template、量化kernel与evaluator，暂停解释压缩结果。
+6. 本实验比较的是最终已量化部署checkpoint，不证明`Quantize→Compress`与`Compress→Quantize`两种顺序等价；顺序比较仍属于Exp #9/后续专门实验。
+
+## 必须保存的产物
+
+```text
+artifacts/exp13_quantized_compression/
+  data_manifest.json
+  quant_calibration_manifest.json
+  fp8/
+    original/
+    reap32/
+    ream32/
+    sprm_26u6m/
+  w4a16/
+    original/
+    reap32/
+    ream32/
+    sprm_26u6m/
+  eval_outputs/
+  quantization_error/
+  benchmark_scores.json
+  domain_summary.csv
+  resource_summary.csv
+```
+
+每个压缩目录必须保存source revision、quantization config、compression config、checkpoint hash、expert计数、router manifest、量化module清单、dtype/scale统计、round-trip误差与逐任务原始输出。Original目录保存不可变source manifest，不重复复制远端checkpoint。
+
+**产出：** FP8和W4A16各4个配置的75% expert压缩兼容性结果、6个压缩checkpoint、2个Original参考、MC8/Code/Math完整评测、重新量化误差和资源统计。
+
+**状态：** 已设计，未运行。执行顺序为`两种precision共享统计 → 两个SPRM round-trip smoke → 8卡并行压缩/评测 → 汇总`；全部主实验在同一台8卡机器上完成，不依赖任何Stage 2训练结果。
+
+---
+
+# Exp #14（2026-10-08）— 论文Stage 1统一实验：4台8×H20并行执行计划
+
+> **目标：** 按本节统一协议完成主实验、保护比例/组件消融、已量化模型兼容性与压缩效率测量。本节是当前待跑实验的唯一调度清单，旧Exp保留为历史记录，不自动加入本次队列。所有配置只运行Stage 1，不运行SFT、LoRA、KD或OPD。
+>
+> **资源：** 4台机器，每台8张H20，共32张GPU。优先一卡一配置；每个配置单进程、独立输出目录。总计42个压缩/消融配置，另有4个未压缩模型参考评测。已配套独立运行代码和CPU测试，正式作业仍须数据访问与完整模型H20/Docker验收；本节不代表实验已运行。
+
+## 1. 全局协议与配置数量
+
+| 实验部分 | 模型 | Calibration tracks | Expert压缩率 | 方法/配置 | 压缩配置数 |
+|----------|------|--------------------|-------------|-----------|-----------:|
+| Main | Qwen3-30B-A3B-Instruct-2507 BF16 | G、X | 67%、75% | REAP、HC-SMoE、REAM、SPRM | 16 |
+| Ablation | Qwen1.5-MoE-A2.7B-Chat BF16 | X | 75% | 五档保护比例+六个组件配置，Full/P80共用 | 10 |
+| Quantized compatibility | Qwen3 FP8、W4A16 | G、X | 75% | REAP、REAM、SPRM | 12 |
+| Efficiency | Qwen1.5-MoE-A2.7B-Chat BF16 | G | 75%（本计划默认，待用户核对） | REAP、HC-SMoE、REAM、SPRM | 4 |
+| Total | | | | | **42** |
+
+原始模型参考为Qwen3 BF16、Qwen1.5 BF16、Qwen3 FP8和Qwen3 W4A16共4个。原始模型不做压缩，不按calibration track复制；Qwen3 BF16/FP8/W4A16各评测G和X，Qwen1.5 BF16评测X作为消融参考。原始模型参考不计入42个压缩配置。
+
+第一轮所有压缩及随机消融只使用seed 42；不额外运行43、44，不增加保护比例100%的条件。一次seed结果不声称跨seed稳定性或统计显著性。
+
+## 2. 模型、精度与结构预算
+
+| ID | 完整model ID | Precision | 层数 | 原始routed experts/layer | Active experts/token |
+|----|---------------|-----------|-----:|-------------------------:|---------------------:|
+| Q3 | `Qwen/Qwen3-30B-A3B-Instruct-2507` | BF16 | 48 | 128 | 8 |
+| Q15 | `Qwen/Qwen1.5-MoE-A2.7B-Chat` | BF16 | 24 | 60 | 4 |
+| F8 | `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` | 源checkpoint的FP8格式 | 48 | 128 | 8 |
+| W4 | `RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16` | 源checkpoint的W4A16格式 | 48 | 128 | 8 |
+
+实际加载时核对config并记录revision/hash；架构不符时先修正配置。Qwen1.5的shared expert保持原样，不计入压缩比例。
+
+```text
+ExpertCompression = 1 - K / E
+ProtectSlotRatio = P / K
+K = P + C
+P = protected expert数；C = Super-Expert数
+```
+
+保护比例分母为最终物理expert预算K，不是原始expert数E。所有主方法在同一模型和压缩条件下具有相同K，保留原Top-k设置，并报告逻辑router slots和唯一物理experts数量。路由选择若采用逻辑slots，必须报告去重后的实际物理专家调用数；不将不同路由语义悄悄改成同一种方法。
+
+| Model/condition | 标称压缩率 | K | 实际压缩率 | Full SPRM | Residual groups |
+|-----------------|-----------:|--:|-----------:|-----------|-----------------|
+| Q3-C67 | 67% | 42 | 67.1875% | `34U+8M` | 剩余94个，8组：6组12个+2组11个 |
+| Q3-C75 / F8 / W4 | 75% | 32 | 75% | `26U+6M` | 剩余102个，6组×17个 |
+| Q15-C75 | 75% | 15 | 75% | `12U+3M` | 剩余48个，3组×16个 |
+
+显式传入K，避免浮点舍入导致不同方法使用不同expert预算。主实验保护分配沿用当前约80% protected slots、20% merged slots；不根据test结果分别优化保护比例。
+
+## 3. 两份Calibration与数据冻结
+
+只有两个压缩calibration tracks。**X是一份Math+Code混合校准集，不拆成Math/Code两个压缩checkpoint。**
+
+| Track | Calibration | 样本数 | 单样本长度上限 | Seed | 对应Evaluation |
+|-------|-------------|-------:|----------------:|-----:|----------------|
+| G / General | C4 | 3,072 | 512 tokens | 42 | MC8 |
+| X / Math+Code | NuminaMath 1,536 + The-Stack-Smol 1,536 | 3,072 | 512 tokens | 42 | MBPP+、HumanEval+、LiveCodeBench、GSM8K、MATH-500 |
+
+两份校准集的token预算上限均为1,572,864 tokens；同时记录实际非padding tokens。1:1是样本数比例，不声称实际有效tokens恰好1:1。不使用OpenThought作为压缩校准集。
+
+### 建议冻结的预处理设置
+
+```yaml
+calibration:
+  source_split: train
+  seed: 42
+  num_sequences: 3072
+  max_sequence_length: 512
+  batch_size: 1
+  split_by_category: false
+  truncate: true
+  padding_tokens_excluded_from_statistics: true
+  cross_sample_packing: false
+  mix_X:
+    NuminaMath: 1536
+    The-Stack-Smol: 1536
+    merge_order: concatenate_then_shuffle_seed_42_and_save
+  training: false
+```
+
+上面是本次拟定设置，需要实际入口显式传入并验收，不能依赖仓库的默认batch_size=8、model_max_length=2048或truncate=false。X分别固定抽取1536条，再合并并用seed 42固定打乱一次，将最终顺序保存；这比已有composite loader的按组件顺序拼接多一个冻结的shuffle步骤，不宣称旧实验已经如此执行。
+
+C4、NuminaMath、The-Stack-Smol的准确HF dataset ID、revision、subset、文本字段、过滤与渲染模板在启动前填写data_manifest。NuminaMath拟使用题目+参考解答，代码拟使用代码正文，C4使用正文；各源具体字段及chat/plain-text模板仍需按实际dataset核对。同一模型同一track的所有方法必须使用完全相同的tokenized inputs。
+
+Math/Code校准数据对本次benchmark进行去重并保存规则/hash；不把benchmark test题目、答案或生成输出加入校准。两个模型可共享源样本ID，各自tokenizer编码后分别保存hash；不得声称不同tokenizer得到完全相同tokens。
+
+## 4. 方法定义、共享统计与实现状态
+
+| Method | 必须采用的定义 | 当前验收要求 |
+|--------|----------------|--------------|
+| REAP | 在对应track计算REAP saliency，保留Top-K原始experts并删除其余权重及对应router rows | 核对最终K、保留权重不变、reload正确 |
+| HC-MoE（代码名HC-SMoE） | expert output characteristic activation距离、average-linkage层次聚类、按routing frequency融合 | 核对论文算法/对齐设置，补齐物理去重与reload，不能仅复制相同权重后声称参数压缩 |
+| REAM | 完整saliency-centroid、pseudo-pruning分配、神经元对齐和saliency-weighted in-place fusion；按方法进行sequential layer-wise recalibration | 冻结实现与参数；不得以SPRM分组或简单平均替代REAM |
+| SPRM | Top-P saliency保护；对全部剩余experts做balanced grouping，组内对齐后融合为C个Super-Experts；grouped router聚合source routing mass | protected权重不变、residual全覆盖、C个独立expert、router与reload数值检查 |
+
+SPRM拟沿用现有设计：0.5×router-profile cosine + 0.5×gated-output cosine做残余分组相似度；组内选择saliency最高的expert作为对齐reference，按归一化组内saliency融合。对齐cost的归一化、activation/weight系数、clustering迭代与tie-break必须在implementation manifest冻结；文档不能代替实际实现验收。
+
+旧HC入口没有启用permutation，且把merged权重复制回原expert slots。Exp14独立实现保留其frequency融合/无permutation设定，但改为K份独立FFN和原logical-router映射，CPU保存/重新加载测试已通过。不能仅设置save_as_tied_params后未经验证声称物理压缩。
+
+共有8个可独立冻结的source-model/calibration统计组合：
+
+```text
+Q3-G, Q3-X, Q15-G, Q15-X,
+F8-G, F8-X, W4-G, W4-X
+```
+
+在同一source revision、precision、track及observer实现下，REAP saliency、routing frequency和可复用的activation profiles只计算一次；Q3同track的C67/C75可复用。不同precision/track不得混用统计。HC的专用统计按其方法采集；REAM层间模型变化所需的重新校准不能由静态Teacher统计替代。
+
+所有方法必须存储K份物理expert权重，避免“融合成K组，但仍存储E份拷贝”。SPRM grouped router与HC逻辑slot映射均保存到manifest，并分别报告原Top-k参数及实际unique-expert调用分布。
+
+## 5. Evaluation统一设置
+
+### Benchmark与指标
+
+| Track | Benchmark | Split/冻结项 | 主指标 |
+|-------|-----------|--------------|--------|
+| G | ARC-Challenge、ARC-Easy、BoolQ、HellaSwag、MMLU、OpenBookQA、RTE、WinoGrande | 固定lm-eval版本、task配置及各task默认evaluation split | MC8任务定义下accuracy指标 |
+| X Math | GSM8K | official test | 固定flexible answer extraction的accuracy |
+| X Math | MATH-500 | official test | answer accuracy |
+| X Code | HumanEval+、MBPP+ | EvalPlus固定dataset revision | expanded-test pass@1 |
+| X Code | LiveCodeBench | 启动前填写固定release与日期区间 | code-generation pass@1 |
+
+MC8明确用RTE，不用PIQA；旧文档/旧分数若任务列表或metrics不同不能复用。MC8沿用本次冻结lm-eval task配置的accuracy键：对有acc_norm的任务固定采用acc_norm，其余采用acc；manifest保存每个task的准确metric key。MMLU先按固定harness口径汇总，再作为MC8中的一项；MC8对8个任务等权平均，不按题数pool。
+
+```yaml
+evaluation:
+  backend: hf_transformers_with_verified_method_adapters
+  seed: 42
+  model_mode: eval
+  mc8_num_fewshot: 0
+  generation:
+    do_sample: false
+    temperature: 0
+    num_return_sequences: 1
+    max_input_length: 2048
+    max_new_tokens: 1024
+  bf16_dtype: bfloat16
+  quantized_dtype: preserve_source_quantization
+  initial_batch_size: 1
+  code_pass_k: 1
+```
+
+2048/1024是沿用此前的第一轮草案，需用户核对；运行前用独立smoke prompts检查长度，再冻结。benchmark特定的chat template、stop tokens、代码模板、few-shot及答案抽取在task manifest里固定；同benchmark所有方法一致。LCB超过输入长度的样本不得静默删除；截断规则和比例必须记录，若改生成预算则对该benchmark全部模型统一修改后再正式运行。batch_size可在正式运行前对所有同组方法共同验证后统一提高，禁止遇到OOM只对某方法改变评测协议而不记录。
+
+保存HumanEval/MBPP基础分数可作为附表，但主表必须是HumanEval+/MBPP+。LCB不是EvalPlus任务，单独保存runner/grader版本、release、日期范围及执行限制。
+
+数学/代码汇总：
+
+```text
+MathAvg = mean(GSM8K, MATH-500)
+CodeAvg = mean(MBPP+, HumanEval+, LiveCodeBench)
+```
+
+所有分数统一转换到0--100再汇总。G和X由不同压缩checkpoint产生，分表报告，不把两者描述成同一个压缩模型同时获得的分数。
+
+当前LCB入口在非server模式下会报错，要求vLLM server；而SPRM grouped router尚未证明能被该server正确执行。正式LCB前必须实现并验证HF生成/LCB grading入口，或验证一个同精度组全部方法均支持的共同后端。HF方案是本计划默认；不在文档中声称适配已完成。代码执行任务设定统一timeout/memory限制，控制CPU并发。
+
+## 6. 保护比例与组件消融：10个唯一配置
+
+两部分都用Q15 BF16、X校准、75%压缩、K=15、Top-4、seed42，并评测完整X五个benchmark。组件消融固定P=12、C=3。
+
+### 保护比例：五档
+
+| ID | ProtectSlotRatio | P | C | Residual grouping |
+|----|-----------------:|--:|--:|-------------------|
+| AB-P00 | 0% | 0 | 15 | 全部60个分成15组×4 |
+| AB-P20 | 20% | 3 | 12 | 57个分12组：9组5个+3组4个 |
+| AB-P40 | 40% | 6 | 9 | 54个分9组×6 |
+| AB-P60 | 60% | 9 | 6 | 51个分6组：3组9个+3组8个 |
+| AB-P80 / AB-Full | 80% | 12 | 3 | 48个分3组×16 |
+
+0%是SPRM的无保护版本，不自动等同于REAM。**不运行100%/15U+0M。** 不用test分数反向选择主实验保护率。
+
+### 组件：六个逻辑行，其中Full复用AB-P80
+
+| ID | Setting | 相对Full的唯一变更 |
+|----|---------|------------------|
+| AB-Full | Full SPRM | 基准；复用AB-P80 |
+| AB-RProtect | Random Protect | seed42随机选12个protected，其余48个重新按Full方式分组；保存选择结果 |
+| AB-RGroup | Random Group | protected与Full相同；seed42将剩余48个随机均衡分成3组×16 |
+| AB-NoAlign | No Alignment | 复用Full protected、groups、reference与fusion weights，只取消permutation |
+| AB-Uniform | Uniform Fusion | 复用Full protected、groups与alignment，将组内权重改为1/16 |
+| AB-Centroid | Centroid Router | 专家权重及分组与Full完全一致；Super-Expert改用组内reference/centroid的单独router logit，取消组内routing mass聚合 |
+
+Random Protect/Group只运行seed42。NoAlign/Uniform/Centroid复用Full的不可变分组等产物，避免同时改变多个因素。Centroid Router直接复用Full expert权重，仅改router，不必再次融合。保护比例五档+组件六行-Full重复一次=10个唯一配置；不计原始Q15参考。
+
+## 7. 量化兼容性：12个压缩配置
+
+```text
+(F8 or W4) × (G or X) × (REAP or REAM or SPRM)
+compression = 75%, E=128, K=32
+SPRM = 26U+6M
+```
+
+每种量化precision都有G/X两份压缩checkpoint；Original量化模型在两个评测track共用。
+
+从已量化source出发进行压缩。REAP直接删除expert，保留的量化payload/scales/zero-points不变；REAM/SPRM仅对参与融合的expert projections反量化到BF16，执行对齐和融合，再按源checkpoint格式重新量化。
+
+SPRM的26个protected量化experts逐bit保留，仅6个Super-Experts重新量化。REAM按修改后的权重重新量化。非expert模块保持source payload；不得平均INT4/FP8编码或scale代替浮点权重融合。
+
+FP8沿用源checkpoint的format/block-size/activation scheme；W4沿用源compressed-tensors scheme、group-size、对称性、module coverage和scale/zero-point dtype，不根据模型名硬编码。对每个precision/track保存merged BF16权重在重新量化前后的误差，并做save/reload检查。
+
+如果W4重新量化需要activation calibration，本轮采用对应track压缩校准集中的固定128条、最多512 tokens：G来自C4，X为64 NuminaMath+64 The-Stack-Smol。子集样本ID、顺序与hash对REAM/SPRM共享；这是本次建议值，启动前验证expert coverage，不能只给单个方法临时扩大。源量化算法如需要其他设置，先冻结实现并更新此项；不声称128条已获充分验证。FP8 weight-only重新量化如无需activation calibration则标为不适用。
+
+重新量化误差属于该兼容性管线成本，主表不额外增加ReQuant-Teacher配置；异常时补诊断，不将重新量化误差自动解释为融合方法失败。
+
+## 8. 四机运行计划与逐卡分配
+
+机器用A/B/C/D逻辑名称，真实hostname、GPU UUID、H20显存容量、CPU cores/RAM、local SSD空间在启动前填写。下面是默认首发分工，完成后以空闲GPU继续补尾部任务；不是要求整个wave完成才放行下一项。
+
+### 第一批
+
+| GPU | A：Q3主实验X | B：Q3主实验G | C：Q15消融X | D：量化X与Original |
+|----:|--------------|--------------|------------|--------------------|
+| 0 | MAIN-X-C67-REAP | MAIN-G-C67-REAP | AB-P00 | Q-F8-X-REAP |
+| 1 | MAIN-X-C67-HC | MAIN-G-C67-HC | AB-P20 | Q-F8-X-REAM |
+| 2 | MAIN-X-C67-REAM | MAIN-G-C67-REAM | AB-P40 | Q-F8-X-SPRM |
+| 3 | MAIN-X-C67-SPRM | MAIN-G-C67-SPRM | AB-P60 | Q-W4-X-REAP |
+| 4 | MAIN-X-C75-REAP | MAIN-G-C75-REAP | AB-Full/P80 | Q-W4-X-REAM |
+| 5 | MAIN-X-C75-HC | MAIN-G-C75-HC | AB-RProtect | Q-W4-X-SPRM |
+| 6 | MAIN-X-C75-REAM | MAIN-G-C75-REAM | AB-RGroup | Original-F8：G+X评测 |
+| 7 | MAIN-X-C75-SPRM | MAIN-G-C75-SPRM | AB-NoAlign，依赖Full产物 | Original-W4：G+X评测 |
+
+C GPU7在Full分组/对齐产物可用后启动；依赖未完成时可先做Q15 Original参考评测或其他独立检查，不强制空等，也不重新计算一份不同Full分组。
+
+每个X配置运行五个benchmark，G配置只跑MC8。Original-F8/W4各自只评测一次全部G/X，不因两份calibration重复运行Original。
+
+### 后续队列与尾部利用
+
+| 机器/阶段 | GPU分配建议 | 工作 |
+|-----------|-------------|------|
+| B的MC8配置完成后 | GPU0--5 | F8-G的REAP/REAM/SPRM，以及W4-G的REAP/REAM/SPRM，共6配置 |
+| B的空闲槽位 | GPU6 | Original-Q3 BF16的G+X参考 |
+| B的空闲槽位 | GPU7 | Original-Q15 BF16的X参考；若已在C完成且hash相同则跳过 |
+| C有空闲卡且Full产物已验证 | 最先空闲的2卡 | AB-Uniform、AB-Centroid |
+| A/C/D逐卡完成后 | 空闲卡 | 接管仍未完成的独立benchmark评测，优先预计耗时最长的X任务 |
+| 一台机器完成其正常队列后，默认B | 固定同一GPU，其余卡不运行干扰作业 | Efficiency四个方法按随机冻结顺序依次测量 |
+
+B无需等8个主配置都结束：单卡空闲且量化G统计准备完成即可接下一配置。跨机接管先完整复制已验证checkpoint与manifest到目标local SSD，不覆盖原产物。不为了利用GPU空槽而同时在同一卡驻留两个大模型。
+
+Efficiency的机器内其他GPU、CPU重负载和checkpoint写入作业暂停；其他三台继续正常队列。该窗口单卡串行是为了获得可比较的资源测量，而不是整个集群停工。
+
+### 启动前置与共享统计
+
+1. 四机安装并冻结同一环境/git revision及dirty diff；把各自需要的模型提前下载到本地只读cache。Q3 BF16优先放A/B，Q15放C及Efficiency机器，量化source放D并同步到B。
+2. 冻结G/X source manifests，按模型tokenizer保存tokenized manifests；核对数据量及非padding tokens。
+3. 分配最多8个独立source/track统计任务，各占1卡；统计完成的分支立即放行，不等8份全部完成。A负责Q3-X，B负责Q3-G及Q15-G，C负责Q15-X，D负责F8/W4的G/X四份。
+4. 统计缓存只在hash匹配时复用；REAM/HC独有步骤仍在各自worker执行。未完成统计时的其他GPU可跑原模型参考或smoke。
+5. 对SPRM、HC以及两种量化融合分别做单层、save/reload和20条固定非test prompts检查；已经通过验收的分支进入正式队列。
+6. 逐步从1 worker增加到4、再到8，检查GPU/CPU内存与local SSD吞吐；单卡内存不足先逐层staging。若仍不能单卡完成，标记该配置资源例外并显式重排，不能静默占用另一worker的GPU。
+
+不能在8个CPU-offload worker中各自无控制地驻留一份完整BF16模型；同时检查host RAM、融合临时workspace和共享磁盘压力。先测速再给每个worker固定CPU线程和code-grader并发预算。
+
+## 9. Worker设置、断点与失败恢复
+
+拟定最小worker约束：
+
+```yaml
+execution:
+  gpus_per_worker: 1
+  world_size: 1
+  cuda_visible_devices: exactly_one_assigned_gpu
+  processes_per_gpu: 1
+  initial_calibration_batch_size: 1
+  initial_eval_batch_size: 1
+  unique_output_dir: true
+  unique_log_and_port: true
+  shared_statistics: read_only_hash_verified
+  teacher_statistics_recompute: false_if_matching_cache_exists
+  model_download_before_launch: true
+  cpu_threads_and_grader_workers: fixed_after_machine_probe
+```
+
+只让worker看到指定GPU，避免device_map=auto跨卡。不得继承整机torchrun/Ray/tensor-parallel环境。每个配置有唯一run ID，包含model、precision、track、K、method、ablation及seed，保存source revision、代码hash和数据hash。不按目录存在判断完成。
+
+按阶段记录：
+
+```text
+pending → statistics_ready → compressed → reload_verified
+        → benchmark_1_done → ... → eval_complete
+```
+
+每个benchmark完成立即保存原始输出、grader结果和状态；仅在输出完整并且hash正确时跳过。生成到一半可按sample ID续跑；保存前写临时文件，校验后原子标记完成。worker失败不终止其他worker。
+
+本轮“断点”指压缩阶段/benchmark/样本级恢复，不涉及训练optimizer。逐层压缩只有在保存了层产物、方法需要的中间模型状态与manifest且实现验证通过时才可续跑；否则从干净source重启该压缩任务，仍复用有效校准缓存。不声称现有脚本已经支持这些功能。
+
+配置稳定后，先用少量样本测量每个方法/benchmark的吞吐与长度，保存estimated remaining time；尾部空闲卡先接预计最久的评测。可将同checkpoint的不同benchmark分到不同空闲GPU；不重复生成checkpoint，不改变prompt/grader。主表不承诺预先估计的完成小时数。
+
+## 10. Efficiency测量：4个配置
+
+本轮默认Q15 BF16、G C4 3072×512、seed42、75%压缩、K15。SPRM为12U+3M；三个基线同K。此压缩率是对用户Efficiency清单缺项的建议，需本次check确认。
+
+每个方法包含完整且独立的校准统计采集和压缩流程。源checkpoint预下载，本地读取；统一运行条件，记录：
+
+| Metric | 范围 |
+|--------|------|
+| calibration_seconds | 该方法所需统计采集及方法要求的额外校准 |
+| compression_seconds | 分组/选择、对齐、融合、结构处理 |
+| checkpoint_save_seconds | 实际checkpoint写出 |
+| total_wall_seconds | 从加载source开始到保存checkpoint完成；排除下载和benchmark评测 |
+| GPU hours | 实际占用GPU数×上述时间/3600，单GPU运行时为total_wall_seconds/3600 |
+| peak_allocated/reserved_VRAM | 重置CUDA峰值统计后记录整个范围；同时采样进程设备显存，避免遗漏非PyTorch allocations |
+| final_checkpoint_GB | 实際模型权重、router及必要量化/映射元数据大小 |
+
+同时给出“统计缓存已存在时”的compression+save时间，不能拿一个方法的cached时间与另一个方法的含calibration时间比较。REAM重复校准计入其成本，HF加载与CPU staging不静默扣除。保存每阶段GPU同步时间、线程数、host RAM峰值及后台负载；测量seed42一轮，避免未申请的额外重复。
+
+Efficiency测量必须实际执行相应方法，即使已有其他配置checkpoint也不能把文件复制耗时当压缩耗时。保存reload/structure结果，但不追加完整benchmark评测。效率结论不从不同后端的吞吐推导。
+
+## 11. 结果表与产物
+
+| 文件/表 | 内容 |
+|---------|------|
+| main_general_C67_C75 | Q3 Teacher+4方法，MC8逐任务/平均；分别记录K42/K32 |
+| main_math_code_C67_C75 | Q3 Teacher+4方法，X五任务及MathAvg/CodeAvg |
+| protect_ratio | 五档保护比例，X五任务及两个domain averages |
+| component_ablation | Full及五种组件变更，X五任务及相对Full差值 |
+| quant_FP8_general / quant_FP8_math_code | FP8 Original+REAP/REAM/SPRM，G/X分表 |
+| quant_W4_general / quant_W4_math_code | W4 Original+REAP/REAM/SPRM，G/X分表 |
+| efficiency_Q15_C75 | 四方法的GPU hours、分阶段时间、峰值显存及checkpoint大小 |
+
+每个结果必须可追溯到明确checkpoint+data/eval manifests；复用旧结果时全项匹配才接受。保持历史结果原始协议，不把混合校准分数改名为C4校准分数。
+
+```text
+artifacts/exp14_stage1_unified/
+  manifests/
+    experiment_plan.json
+    data_G.json
+    data_X.json
+    tokenized_by_model/
+    benchmark_protocols.json
+    implementation_status.json
+    hardware_by_host.json
+  shared_statistics/<source_precision>/<track>/
+  main/<track>/<K>/<method>/
+  ablation/<setting>/
+  quant/<precision>/<track>/<method>/
+  original/<source_precision>/
+  efficiency/<method>/
+  runs/<run_id>/
+    config.json
+    status.json
+    timings.json
+    logs/
+    checkpoint_manifest.json
+    eval/<benchmark>/
+  tables/
+```
+
+上面是计划中的产物约定，本次文档编辑不创建这些运行目录。run记录包含唯一GPU UUID、hostname、开始结束时间、数据与checkpoint hash、完整命令及异常事件。
+
+## 12. 用户check与开跑前待冻结项
+
+已按用户要求固定：四台8×H20、主模型Q3、主压缩67%/75%、两个calibration tracks均3072×512、量化75%、五档Protect、不跑100%、Random仅seed42、X评测包含LiveCodeBench、只Stage1。
+
+请核对以下建议/待补全值：
+
+| 项目 | 本次草案 |
+|------|----------|
+| 保护比例消融压缩率 | 75%，K15 |
+| Efficiency压缩率 | 75%，K15 |
+| Full SPRM主结构 | Q3：34U+8M / 26U+6M；Q15：12U+3M |
+| Gen长度 | input2048/new1024，greedy，初始batch1 |
+| MC8 | RTE而非PIQA，0-shot，逐task metric key冻结 |
+| X混合顺序 | 各1536样本，合并后seed42固定shuffle |
+| W4额外requant calibration | 本次实现为weight-only RTN，同原packed格式；不需额外activation calibration，不能声称复用了原GPTQ/MSE量化recipe |
+| Source/dataset revisions | 运行前填写，当前不编造版本 |
+| LCB release/date及code timeout | release_v6，filter=2025-01-01至2025-07-31，timeout=120秒；v6实际仅覆盖至2025-04，记录实际题目日期与数量，不声称包含5–7月 |
+| 对齐/分组的完整实现参数 | 已冻结在reap.exp14.protocol和experiments/exp14/README.md |
+| HC物理压缩与对齐 | 已实现K份FFN、原logical-slot router映射；frequency fusion，无permutation；CPU保存/加载一致性测试通过 |
+| HF LCB、量化grouped router | 已实现HF生成+官方grader隔离适配，FP8/W4格式往返和路由CPU测试通过；完整模型CUDA/Docker验收待集群执行 |
+| 样本级/逐层resume | 已实现身份校验、原子保存、逐样本生成与逐层压缩恢复；REAM恢复前缀及下一层hidden trajectory，CPU中断测试通过 |
+
+**实现状态（2026-10-08）：** 已补齐独立Stage-1入口、四种方法、五档Protect和五项组件变化、原生量化payload、统一评测、四机独立卡队列/可选跨机器补尾、资源测量、断点恢复与结果汇总。仅调度本节42个配置及4个Original参考，不启动训练或旧Exp。方法/校准/路由/保存加载/恢复、自适应评测并发与原有REAP统计测试共37项通过，含真实MC8 adapter的冻结合成数据运行。**尚未执行完整30B/H20跑分及Docker隔离判分，未产生新实验分数；不能将CPU测试当作集群验收。**
+
+实际实现和操作以[运行说明](experiments/exp14/README.md)为准，入口为bash scripts/run_exp14.sh，公开子命令为plan、prepare、prefetch、stats、job、launch、aggregate；自适应队列内部调用eval-helper和grade-task。模型与数据revision在prepare时真实解析并冻结，未编造版本；正式运行前需要本人确认/接受数据集访问协议，并在四台H20上预下载源模型、构建grader镜像和测量RAM/VRAM/SSD峰值。量化使用明确记录的reference dequant-GEMM后端，证明的是格式/功能兼容，不声称优化量化kernel的吞吐优势。与旧通用评测入口相比，数学/LCB异常不再被吞掉。
+
+冷启动Efficiency测量若中断，不伪造可恢复的时间：旧部分产物移动到interrupted-*审计目录，再从干净source冷测量，其他压缩/评测保留有效层和样本继续。未删除任何用户结果；paper/和已有results/不纳入本次实现提交。
+
+## 14. 自适应评测补尾（2026-10-08追加）
+
+推荐四台机器的launch命令均同时启用--steal --adaptive-eval，其他科学setting不变。共享root需支持POSIX文件锁，每台预下载全部四种源模型；本机独立root可启用--adaptive-eval，但不能跨机--steal。
+
+1. 空闲GPU优先领取尚未启动且依赖已就绪的压缩配置；没有可运行的新配置时，协助正在生成的Math/Code评测。
+2. 固定32条样本/chunk，primary与helper互斥认领。同一checkpoint全局最多2个helper（尾部最多primary+2 helper=3张卡，每进程仍1卡）；不改变样本、prompt、精度、greedy、2048/1024长度或grader，不删慢题、不缩短生成。
+3. 以已完成chunk的平均每题耗时×剩余题数估计尾部时间，优先协助预计剩余时间较长的任务；无观测时按剩余样本数排序。副本加载成本与共享存储开销单独记录，不能保证任意短尾都加速。
+4. GPU完成生成即退出释放卡；数学判分与隔离代码grader进入独立CPU队列，每机最多2个grader，代码容器每个4 CPU/8 GiB。某benchmark所有chunks生成完成即可判分，不等其他benchmark。
+5. 样本ID、prompt hash、完整实验identity、chunk锁与原子保存保证不重样。异常退出后重跑同一launch命令，复用partial chunk内有效样本；launcher被打断时子进程仍持有claim，防止重复认领。
+6. status=waiting_evaluation不等于完成：primary GPU阶段退出且所有benchmark结果完整/身份匹配后才complete；helper/grader失败显式报错并保留已完成兄弟任务。MC8不拆分。
+7. Efficiency不启用helper；A机清空本机GPU/CPU队列后单卡冷测量，测量期间不派发新helper或grader，其他三台继续并行。
+
+每机命令示例（A替换为B/C/D）：
+
+    bash scripts/run_exp14.sh launch --root /shared/exp14 --host A --gpus 0,1,2,3,4,5,6,7 --steal --adaptive-eval
+
+调度参数记录在scheduler-<host>.json，逐chunk进度、原始sample、CPU判分秒数和helper GPU hours单独保存。本策略不能用primary GPU时间代表全部评测GPU成本。正式多机吞吐与Docker安全隔离仍须在H20集群验收，CPU并发测试不等于已运行完整评测。
