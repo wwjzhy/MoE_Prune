@@ -2548,3 +2548,73 @@ artifacts/exp14_stage1_unified/
     bash scripts/run_exp14.sh launch --root /shared/exp14 --host A --gpus 0,1,2,3,4,5,6,7 --steal --adaptive-eval
 
 调度参数记录在scheduler-<host>.json，逐chunk进度、原始sample、CPU判分秒数和helper GPU hours单独保存。本策略不能用primary GPU时间代表全部评测GPU成本。正式多机吞吐与Docker安全隔离仍须在H20集群验收，CPU并发测试不等于已运行完整评测。
+
+---
+
+# Exp #15（2026-10-11）— Q30固定3个Super-Experts的保护—融合配置实验
+
+> **目标：** 在Exp #14相同专家预算、校准集和评测协议下，将Q30的SPRM配置统一改为`xP+3M`，检查增加保护槽位、将全部残余专家集中融合为3个Super-Experts的效果。本节为新增实验计划，不覆盖Exp #14，不启动训练或评测。
+
+## 1. 模型、预算与实验范围
+
+Q30包括Exp #14的Q3 BF16、F8 FP8和W4 W4A16三个源模型，均为48层、每层128个routed experts、Top-8。模型ID、revision、非expert模块与量化格式沿用Exp #14。量化模型仅运行原计划的75%条件，不新增67%量化条件。Q15配置不变。
+
+`P`表示权重完全不变的protected experts（旧记法`U`），`M`表示独立Super-Experts。最终物理专家预算`K=P+3`；每层保护Top-P原始专家，**所有其余原始专家**融合为3个Super-Experts，不直接丢弃残余专家。压缩率为`1-K/128`，不是整个模型参数量或checkpoint大小的压缩率。
+
+| Source | 标称压缩率 | K | 实际expert压缩率 | Exp #14对照 | Exp #15结构 | 残余分组容量 |
+|--------|-----------:|--:|-----------------:|-------------|-------------|--------------|
+| Q3 BF16 | 67% | 42 | 67.1875% | 34P+8M | **39P+3M** | 89个，30+30+29 |
+| Q3 BF16 | 75% | 32 | 75% | 26P+6M | **29P+3M** | 99个，33+33+33 |
+| F8 FP8 | 75% | 32 | 75% | 26P+6M | **29P+3M** | 99个，33+33+33 |
+| W4 W4A16 | 75% | 32 | 75% | 26P+6M | **29P+3M** | 99个，33+33+33 |
+
+每行分别运行G和X两个track，共**8个新增压缩/评测配置**。不额外运行Teacher、REAP、REAM或HC-SMoE；只有checkpoint与评测identity完全匹配时才复用Exp #14对应结果。
+
+## 2. Calibration与Evaluation
+
+| Track | Calibration | 数量/长度上限 | Evaluation |
+|-------|-------------|---------------|------------|
+| G | C4 | 3,072条，每条最多512 tokens | MC8：ARC-c、ARC-e、BoolQ、HellaSwag、MMLU、OpenBookQA、RTE、WinoGrande |
+| X | NuminaMath + The-Stack-Smol | 各1,536条，共3,072条，每条最多512 tokens | GSM8K、MATH-500、HumanEval+、MBPP+、LiveCodeBench |
+
+全部使用seed 42，复用Exp #14冻结的源revision、校准样本ID、渲染/去重规则、tokenized inputs、X混合顺序与hash。G和X分别生成checkpoint；X的数学、代码评测共用同一混合校准checkpoint，不拆成两个压缩模型。统计缓存只有source revision、precision、track和observer identity全项匹配时可复用，不跨精度/track混用。
+
+评测沿用Exp #14实际实现：HF Transformers后端、eval模式、0-shot、batch size 1、greedy单次生成（do_sample=false）；生成输入上限2,048 tokens、max_new_tokens=1,024，沿用原chat template、截断、stop及答案抽取规则。MC8用冻结的log-likelihood task配置与metric keys，8项等权平均；代码主指标为HumanEval+/MBPP+ expanded-test pass@1及LCB pass@1；数学报告逐任务accuracy与MathAvg。G与X分表，不汇总成同一checkpoint的综合分数。
+
+LCB保持release_v6和2025-01-01至2025-07-31过滤条件，沿用冻结题目清单，记录实际日期/数量；v6实际仅覆盖至2025-04，不声称有5–7月题目。EvalPlus/数学判分版本、代码隔离与超时等均继承Exp #14，不因任务慢而减少题目或生成长度。
+
+## 3. SPRM算法：只改变P与M
+
+1. 每层使用相同校准上的REAP saliency排序，保护Top-39或Top-29；保护权重保持不变。
+2. 剩余89或99个专家采用Exp #14当前实现的**固定saliency锚点+容量约束贪心分组**，分别形成30/30/29或33/33/33三个非空组；不是迭代k-medoids。
+3. 分组相似度保持`0.5 × router-profile cosine + 0.5 × gated-output cosine`。组内选择saliency最高的专家作为reference，沿用神经元对齐和归一化saliency加权融合。对齐样本上限32,768、PCA rank 64及其余实现参数不变。
+4. protected单例保留原routing logit，残余组使用原source logits的grouped log-sum-exp聚合，在K个物理专家上选Top-8；不改为centroid router。
+5. FP8/W4A16的protected量化payload/scales等逐bit保留，仅3个融合expert projections按Exp #14相同reference requantization recipe重新量化。非expert模块保持source payload，不平均量化编码。
+6. 仅Stage 1：不运行SFT、LoRA、KD或OPD。保存每层protected IDs、组成员、reference、permutation、融合权重及router manifest。
+
+逐层验收：`P+3=K`；P个单例与3组两两不相交且覆盖全部128个source experts；组容量符合上表；K份独立FFN；保护权重/量化payload不变；Top-8物理选择无重复；前向finite；保存/reload与router数值一致。
+
+## 4. 一台8×H20并行计划
+
+| GPU | Job ID | Source | Track | K | 结构 |
+|----:|--------|--------|-------|--:|------|
+| 0 | E15-Q3-G-K42-P39-M3 | BF16 | G | 42 | 39P+3M |
+| 1 | E15-Q3-X-K42-P39-M3 | BF16 | X | 42 | 39P+3M |
+| 2 | E15-Q3-G-K32-P29-M3 | BF16 | G | 32 | 29P+3M |
+| 3 | E15-Q3-X-K32-P29-M3 | BF16 | X | 32 | 29P+3M |
+| 4 | E15-F8-G-K32-P29-M3 | FP8 | G | 32 | 29P+3M |
+| 5 | E15-F8-X-K32-P29-M3 | FP8 | X | 32 | 29P+3M |
+| 6 | E15-W4-G-K32-P29-M3 | W4A16 | G | 32 | 29P+3M |
+| 7 | E15-W4-X-K32-P29-M3 | W4A16 | X | 32 | 29P+3M |
+
+一卡一配置、独立输出目录。先验证共享统计identity与模型/数据缓存，再并行压缩、save/reload和评测。空闲卡可沿用Exp #14自适应补尾协议：32条/chunk、每checkpoint最多2个helpers；每机最多2个CPU graders，代码容器每个4 CPU/8 GiB。记录所有primary/helper的GPU hours、显存和保存/评测耗时，不把primary时间当作总成本。
+
+建议产物根目录`artifacts/exp15_q30_fixed3/`，按Job ID隔离；实验identity必须包含Exp #15、K、P=39/29、M=3和完整source/data/eval hash，不能复用Exp #14旧SPRM压缩产物或覆盖旧结果。沿用逐层压缩、逐样本生成和判分恢复语义；启动前验证新identity与scheduler注册。
+
+## 5. 对照、汇总与结论边界
+
+每个source/track/K报告Teacher、REAP、HC-SMoE（仅BF16）、REAM、Exp #14旧SPRM及Exp #15固定3M的逐benchmark分数；可复用结果必须先通过协议核对。优先报告新旧SPRM差值、相对同预算最强基线差值，以及压缩/评测成本。仅seed 42，不声称跨seed稳定性或统计显著。
+
+本实验测试**固定预算下保护槽位与融合槽位的分配**，同时改变保护数量、残余成员和单组规模；不能把差异单独归因于“更多保护”或“3个Super-Experts”，也不能根据各benchmark test结果重新调节P。结果未知，不预设3M优于原配置。
+
+**状态：** 仅实验计划，未运行。Exp #14当前`jobs()`仍注册34P+8M/26P+6M，尚无Exp #15专用plan/launch入口；现有SPRM分组逻辑支持`P=K-3`，但此文档提交不代表8个配置已接入可执行队列或通过完整H20/量化验收。后续执行前需新增独立job注册并核对恢复identity，保持Exp #14原配置与产物不变。
